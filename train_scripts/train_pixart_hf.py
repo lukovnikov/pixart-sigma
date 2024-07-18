@@ -24,7 +24,6 @@ from pathlib import Path
 from typing import List, Union
 
 import datasets
-import fire
 import numpy as np
 import torch
 import torch.nn.functional as F
@@ -89,11 +88,10 @@ These are LoRA adaption weights for {base_model}. The weights were fine-tuned on
 
 ROOTNAME = "PixArt-alpha/PixArt-Sigma-XL-2-1024-MS"
 
-
-def parse_args(kwargs=None):
+def parse_args():
     parser = argparse.ArgumentParser(description="Simple example of a training script.")
     parser.add_argument(
-        "--pretrained_model_name_or_path",
+        "--pretrained_model_name_or_path", "--model",
         type=str,
         default=None,
         help="Path to pretrained model or model identifier from huggingface.co/models.",
@@ -134,18 +132,13 @@ def parse_args(kwargs=None):
         help="The column of the dataset containing a caption or a list of captions.",
     )
     parser.add_argument(
-        "--validation_prompt", type=str, default=None, help="A prompt that is sampled during training for inference."
+        "--validation_prompt", type=str, default="a stylized portrait drawing the style of thisnewartistA", help="A prompt that is sampled during training for inference."
     )
     parser.add_argument(
         "--num_validation_images",
         type=int,
         default=3,
         help="Number of images that should be generated during validation with `validation_prompt`.",
-    )
-    parser.add_argument(
-        "--validation_guidance_scale", "--valcfg",
-        type=float,
-        default=4.5,
     )
     parser.add_argument(
         "--validate_every",
@@ -166,7 +159,7 @@ def parse_args(kwargs=None):
         ),
     )
     parser.add_argument(
-        "--output_dir", "--outdir",
+        "--output_dir",
         type=str,
         default=None,
         help="The output directory where the model predictions and checkpoints will be written.",
@@ -202,9 +195,9 @@ def parse_args(kwargs=None):
         help="whether to randomly flip images horizontally",
     )
     parser.add_argument(
-        "--train_batch_size", "--batsize", type=int, default=4, help="Batch size (per device) for the training dataloader."
+        "--train_batch_size", type=int, default=4, help="Batch size (per device) for the training dataloader."
     )
-    parser.add_argument("--num_train_steps", "--numsteps", type=int, default=5000)
+    parser.add_argument("--num_train_steps", type=int, default=10000)
     
     parser.add_argument(
         "--gradient_accumulation_steps",
@@ -218,9 +211,9 @@ def parse_args(kwargs=None):
         help="Whether or not to use gradient checkpointing to save memory at the expense of slower backward pass.",
     )
     parser.add_argument(
-        "--learning_rate", "--lr",
+        "--learning_rate",
         type=float,
-        default=1e-4,
+        default=1e-6,
         help="Initial learning rate (after the potential warmup period) to use.",
     )
     parser.add_argument(
@@ -360,7 +353,7 @@ def parse_args(kwargs=None):
     parser.add_argument(
         "--lora_rank",
         type=int,
-        default=4,
+        default=16,
         help="The dimension of the LoRA update matrices.",
     )
     parser.add_argument(
@@ -378,12 +371,21 @@ def parse_args(kwargs=None):
 
     parser.add_argument("--local-rank", type=int, default=-1)
 
-    args = parser.parse_args(kwargs)
+    args = parser.parse_args()
     env_local_rank = int(os.environ.get("LOCAL_RANK", -1))
     if env_local_rank != -1 and env_local_rank != args.local_rank:
         args.local_rank = env_local_rank
 
     return args
+
+
+def validate_args(args):
+    # Sanity checks
+    if args.dataset_name is None and args.train_data_dir is None:
+        raise ValueError("Need either a dataset name or a training folder.")
+
+    if args.proportion_empty_prompts < 0 or args.proportion_empty_prompts > 1:
+        raise ValueError("`--proportion_empty_prompts` must be in the range [0, 1].")
 
 
 DATASET_NAME_MAPPING = {"lambdalabs/pokemon-blip-captions": ("image", "text"),
@@ -505,6 +507,7 @@ def load_model(args, accelerator):
     # For mixed precision training we cast all non-trainable weights
     # (vae, non-lora text_encoder and non-lora transformer) to half-precision
     # as these weights are only used for inference, keeping weights in full precision is not required.
+    
     weight_dtype = torch.float32
     if accelerator.mixed_precision == "fp16":
         weight_dtype = torch.float16
@@ -523,13 +526,6 @@ def load_model(args, accelerator):
     vae.to(accelerator.device)
 
     transformer = Transformer2DModel.from_pretrained(args.pretrained_model_name_or_path, subfolder="transformer", torch_dtype=weight_dtype)
-
-    # freeze parameters of models to save more memory
-    transformer.requires_grad_(False)
-    
-    # Freeze the transformer parameters before adding adapters
-    for param in transformer.parameters():
-        param.requires_grad_(False)
         
     return transformer, tokenizer, text_encoder, noise_scheduler, vae, weight_dtype
 
@@ -608,92 +604,8 @@ def configure_optimizer(args, lora_layers, transformer, accelerator):
 
 
 def configure_lora(args, transformer, accelerator):
-    
-    lora_config = LoraConfig(
-        r=args.lora_rank,
-        init_lora_weights="gaussian",
-        target_modules=[
-            "to_k",
-            "to_q",
-            "to_v",
-            "to_out.0",
-            "proj_in",
-            "proj_out",
-            "ff.net.0.proj",
-            "ff.net.2",
-            "proj",
-            "linear",
-            "linear_1",
-            "linear_2",
-        ],
-        use_dora=args.use_dora,
-        use_rslora=args.use_rslora
-    )
-
-    # Move transformer, vae and text_encoder to device and cast to weight_dtype
-    transformer.to(accelerator.device)
-
-    def cast_training_params(model: Union[torch.nn.Module, List[torch.nn.Module]], dtype=torch.float32):
-        if not isinstance(model, list):
-            model = [model]
-        for m in model:
-            for param in m.parameters():
-                # only upcast trainable parameters into fp32
-                if param.requires_grad:
-                    param.data = param.to(dtype)
-
-    transformer = get_peft_model(transformer, lora_config)
-    if args.mixed_precision == "fp16":
-        # only upcast trainable parameters (LoRA) into fp32
-        cast_training_params(transformer, dtype=torch.float32)
-
-    transformer.print_trainable_parameters()
-
-    # 10. Handle saving and loading of checkpoints
-    # `accelerate` 0.16.0 will have better support for customized saving
-    if version.parse(accelerate.__version__) >= version.parse("0.16.0"):
-        # create custom saving & loading hooks so that `accelerator.save_state(...)` serializes in a nice format
-        def save_model_hook(models, weights, output_dir):
-            if accelerator.is_main_process:
-                transformer_ = accelerator.unwrap_model(transformer)
-                lora_state_dict = get_peft_model_state_dict(transformer_, adapter_name="default")
-                StableDiffusionPipeline.save_lora_weights(os.path.join(output_dir, "transformer_lora"), lora_state_dict)
-                # save weights in peft format to be able to load them back
-                transformer_.save_pretrained(output_dir)
-
-                for _, model in enumerate(models):
-                    # make sure to pop weight so that corresponding model is not saved again
-                    weights.pop()
-
-        def load_model_hook(models, input_dir):
-            # load the LoRA into the model
-            transformer_ = accelerator.unwrap_model(transformer)
-            transformer_.load_adapter(input_dir, "default", is_trainable=True)
-
-            for _ in range(len(models)):
-                # pop models so that they are not loaded again
-                models.pop()
-
-        accelerator.register_save_state_pre_hook(save_model_hook)
-        accelerator.register_load_state_pre_hook(load_model_hook)
-
-    if args.enable_xformers_memory_efficient_attention:
-        if is_xformers_available():
-            import xformers
-
-            xformers_version = version.parse(xformers.__version__)
-            if xformers_version == version.parse("0.0.16"):
-                logger.warn(
-                    "xFormers 0.0.16 cannot be used for training in some GPUs. If you observe problems during training,"
-                    "please update xFormers to at least 0.0.17. "
-                    "See https://huggingface.co/docs/diffusers/main/en/optimization/xformers for more details."
-                )
-            transformer.enable_xformers_memory_efficient_attention()
-        else:
-            raise ValueError("xformers is not available. Make sure it is installed correctly")
-
-    lora_layers = list(filter(lambda p: p.requires_grad, transformer.parameters()))
-    return lora_layers
+    trainable_layers = transformer.parameters()
+    return trainable_layers
 
 
 def configure_lr_scheduler(args, train_dataloader, optimizer, accelerator):
@@ -707,7 +619,6 @@ def configure_lr_scheduler(args, train_dataloader, optimizer, accelerator):
 
 
 def save_checkpoint(args, accelerator, transformer, global_step):
-    # _before_ saving state, check if this save would set us over the `checkpoints_total_limit`
     if args.checkpoints_total_limit is not None:
         checkpoints = os.listdir(args.output_dir)
         checkpoints = [d for d in checkpoints if d.startswith("checkpoint")]
@@ -731,24 +642,13 @@ def save_checkpoint(args, accelerator, transformer, global_step):
     accelerator.save_state(save_path)
 
     unwrapped_transformer = accelerator.unwrap_model(transformer, keep_fp32_wrapper=False)
-    transformer_lora_state_dict = get_peft_model_state_dict(unwrapped_transformer)
 
-    StableDiffusionPipeline.save_lora_weights(
+    unwrapped_transformer.save_pretrained(
         save_directory=save_path,
-        unet_lora_layers=transformer_lora_state_dict,
         safe_serialization=True,
     )
 
     logger.info(f"Saved state to {save_path}")
-
-
-def validate_args(args):
-    # Sanity checks
-    if args.dataset_name is None and args.train_data_dir is None:
-        raise ValueError("Need either a dataset name or a training folder.")
-
-    if args.proportion_empty_prompts < 0 or args.proportion_empty_prompts > 1:
-        raise ValueError("`--proportion_empty_prompts` must be in the range [0, 1].")
 
 
 def main(args):
@@ -771,7 +671,7 @@ def main(args):
     # We need to initialize the trackers we use, and also store our configuration.
     # The trackers initializes automatically on the main process.
     if accelerator.is_main_process:
-        accelerator.init_trackers("pixart-lora-tune", config=vars(args))
+        accelerator.init_trackers("pixart-fine-tune", config=vars(args))
 
 
 
@@ -819,9 +719,9 @@ def main(args):
         # Only show the progress bar once on each machine.
         disable=not accelerator.is_local_main_process,
     )
-    
-    train_dl_iter = iter(train_dataloader)
 
+    train_dl_iter = iter(train_dataloader)
+    
     for _ in range(global_step, args.num_train_steps):
         transformer.train()
         train_loss = 0.0
@@ -833,6 +733,7 @@ def main(args):
             train_dl_iter = iter(train_dataloader)
             batch = next(train_dl_iter)
         
+        # do step
         with accelerator.accumulate(transformer):
             # Convert images to latent space
             latents = vae.encode(batch["pixel_values"].to(dtype=weight_dtype)).latent_dist.sample()
@@ -925,6 +826,7 @@ def main(args):
 
                 if global_step % args.checkpointing_steps == 0:
                     if accelerator.is_main_process:
+                        # _before_ saving state, check if this save would set us over the `checkpoints_total_limit`
                         save_checkpoint(args, accelerator, transformer, global_step)
 
             logs = {"step_loss": loss.detach().item(), "lr": lr_scheduler.get_last_lr()[0]}
@@ -980,16 +882,16 @@ def main(args):
     if accelerator.is_main_process:
         transformer = accelerator.unwrap_model(transformer, keep_fp32_wrapper=False)
         transformer.save_pretrained(args.output_dir)
-        lora_state_dict = get_peft_model_state_dict(transformer)
-        StableDiffusionPipeline.save_lora_weights(os.path.join(args.output_dir, "transformer_lora"), lora_state_dict)
+        # lora_state_dict = get_peft_model_state_dict(transformer)
+        # StableDiffusionPipeline.save_lora_weights(os.path.join(args.output_dir, "transformer_lora"), lora_state_dict)
 
     # Final inference
     # Load previous transformer
     transformer = Transformer2DModel.from_pretrained(
         args.pretrained_model_name_or_path, subfolder='transformer', torch_dtype=weight_dtype
     )
-    # load lora weight
-    transformer = PeftModel.from_pretrained(transformer, args.output_dir)
+    # # load lora weight
+    # transformer = PeftModel.from_pretrained(transformer, args.output_dir)
     # Load previous pipeline
     pipeline = DiffusionPipeline.from_pretrained(
         ROOTNAME, transformer=transformer, text_encoder=text_encoder, vae=vae,
@@ -1025,31 +927,15 @@ def main(args):
                     )
 
     accelerator.end_training()
-    
-    
-def mainfire(
-        train_data_dir="/USERSPACE/lukovdg1/artdata/finnfrei/train/",
-        output_dir="pixart-model-finetuned-lora-finnfrei",
-        pretrained_model_name_or_path="PixArt-alpha/PixArt-Sigma-XL-2-512-MS",
-        validation_prompt="a stylized portrait drawing the style of thisnewartistA",
-        learning_rate=1e-4,
-        validation_guidance_scale=3.0,
-        lora_rank=16,
-        num_train_steps=5000,
-        **kwargs,
-    ):
-        fargs = locals().copy()
-        del fargs["kwargs"]
-        
-        actualargs = []
-        for k, v in fargs.items():
-            actualargs.append(f"--{k}={v}")
-        for k, v in kwargs.items():
-            actualargs.append(f"--{k}={v}")
-        args = parse_args(actualargs)
-            
-        main(args)
 
 
 if __name__ == "__main__":
-    fire.Fire(mainfire())
+    args = parse_args()
+    
+    args.pretrained_model_name_or_path = "PixArt-alpha/PixArt-Sigma-XL-2-512-MS"
+    args.train_data_dir = "/USERSPACE/lukovdg1/artdata/finnfrei/train/"
+    args.output_dir = "pixart-model-finetuned-finnfrei"
+    
+    args.learning_rate = 1e-5
+    
+    main(args)

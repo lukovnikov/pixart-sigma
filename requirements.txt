@@ -1,10 +1,10 @@
 mmcv==1.7.0
-git+https://github.com/huggingface/diffusers
+# git+https://github.com/huggingface/diffusers
 timm==0.6.12
 accelerate==0.25.0
 tensorboard
 tensorboardX
-transformers==4.36.1
+# transformers==4.36.1
 sentencepiece~=0.1.99
 ftfy
 beautifulsoup4
