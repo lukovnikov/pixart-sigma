@@ -24,6 +24,7 @@ from pathlib import Path
 from typing import List, Union
 
 import datasets
+import fire
 import numpy as np
 import torch
 import torch.nn.functional as F
@@ -36,7 +37,6 @@ from accelerate.utils import ProjectConfiguration, set_seed
 from datasets import load_dataset
 from huggingface_hub import create_repo, upload_folder
 from packaging import version
-from peft import LoraConfig, get_peft_model_state_dict, get_peft_model, PeftModel
 from torchvision import transforms
 from tqdm.auto import tqdm
 
@@ -88,7 +88,7 @@ These are LoRA adaption weights for {base_model}. The weights were fine-tuned on
 
 ROOTNAME = "PixArt-alpha/PixArt-Sigma-XL-2-1024-MS"
 
-def parse_args():
+def parse_args(inpargs):
     parser = argparse.ArgumentParser(description="Simple example of a training script.")
     parser.add_argument(
         "--pretrained_model_name_or_path", "--model",
@@ -143,7 +143,7 @@ def parse_args():
     parser.add_argument(
         "--validate_every",
         type=int,
-        default=100,
+        default=None,
         help=(
             "Run fine-tuning validation every X epochs. The validation process consists of running the prompt"
             " `args.validation_prompt` multiple times: `args.num_validation_images`."
@@ -269,7 +269,7 @@ def parse_args():
     parser.add_argument(
         "--dataloader_num_workers",
         type=int,
-        default=10,
+        default=8,
         help=(
             "Number of subprocesses to use for data loading. 0 means that the data will be loaded in the main process."
         ),
@@ -323,6 +323,15 @@ def parse_args():
     )
     parser.add_argument("--local_rank", type=int, default=-1, help="For distributed training: local_rank")
     parser.add_argument(
+        "--save_every",
+        type=int,
+        default=500,
+        help=(
+            "Save a checkpoint of the training state every X updates. These checkpoints are only suitable for resuming"
+            " training using `--resume_from_checkpoint`."
+        ),
+    )
+    parser.add_argument(
         "--checkpointing_steps",
         type=int,
         default=500,
@@ -371,7 +380,7 @@ def parse_args():
 
     parser.add_argument("--local-rank", type=int, default=-1)
 
-    args = parser.parse_args()
+    args = parser.parse_args(inpargs)
     env_local_rank = int(os.environ.get("LOCAL_RANK", -1))
     if env_local_rank != -1 and env_local_rank != args.local_rank:
         args.local_rank = env_local_rank
@@ -828,6 +837,11 @@ def main(args):
                     if accelerator.is_main_process:
                         # _before_ saving state, check if this save would set us over the `checkpoints_total_limit`
                         save_checkpoint(args, accelerator, transformer, global_step)
+                        
+                if global_step % args.save_every == 0:
+                    if accelerator.is_main_process:
+                        accelerator.unwrap_model(transformer).save_pretrained(Path(args.output_dir) / f"dit-{global_step}")
+                
 
             logs = {"step_loss": loss.detach().item(), "lr": lr_scheduler.get_last_lr()[0]}
             progress_bar.set_postfix(**logs)
@@ -929,13 +943,61 @@ def main(args):
     accelerator.end_training()
 
 
+def mainfire(
+        train_data_dir="/USERSPACE/lukovdg1/artdata/finnfrei/train/",
+        output_dir="pixart-model-finetuned-lora-finnfrei",
+        pretrained_model_name_or_path="PixArt-alpha/PixArt-Sigma-XL-2-512-MS",
+        validation_prompt="a portrait of a woman",
+        learning_rate=1e-5,
+        num_train_steps=10000,
+        **kwargs,
+    ):
+        fargs = locals().copy()
+        del fargs["kwargs"]
+        
+        actualargs = []
+        for k, v in fargs.items():
+            actualargs.append(f"--{k}={v}")
+        for k, v in kwargs.items():
+            actualargs.append(f"--{k}={v}")
+        args = parse_args(actualargs)
+            
+        main(args)
+        
+        
+def mainfire_pixelart(
+        dataset_name="jainr3/diffusiondb-pixelart",
+        output_dir="pixart-fulltune_pixelart",
+        pretrained_model_name_or_path="PixArt-alpha/PixArt-Sigma-XL-2-512-MS",
+        validation_prompt="a portrait of a woman",
+        validate_every=250,
+        learning_rate=1e-5,
+        max_grad_norm=1.,
+        num_train_steps=10000,
+        checkpointing_steps=500,
+        save_every=500,
+        # mixed_precision="fp16",
+        train_batch_size=2,
+        gradient_accumulation_steps=4,
+        gradient_checkpointing=True,
+        seed=1337,
+        **kwargs,
+    ):
+        fargs = locals().copy()
+        del fargs["kwargs"]
+        
+        actualargs = []
+        for k, v in fargs.items():
+            if v is True:
+                actualargs.append(f"--{k}")
+            else:
+                actualargs.append(f"--{k}={v}")
+        for k, v in kwargs.items():
+            actualargs.append(f"--{k}={v}")
+        args = parse_args(actualargs)
+            
+        main(args)
+
+
 if __name__ == "__main__":
-    args = parse_args()
-    
-    args.pretrained_model_name_or_path = "PixArt-alpha/PixArt-Sigma-XL-2-512-MS"
-    args.train_data_dir = "/USERSPACE/lukovdg1/artdata/finnfrei/train/"
-    args.output_dir = "pixart-model-finetuned-finnfrei"
-    
-    args.learning_rate = 1e-5
-    
-    main(args)
+    fire.Fire(mainfire_pixelart())

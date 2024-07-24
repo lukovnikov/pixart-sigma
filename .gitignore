@@ -161,3 +161,10 @@ output/
 #cache for docker
 docker/cache/gradio
 docker/cache/huggingface
+
+wandb/
+train_scripts/**/*-finetuned-*
+control_ae_output*
+pixart-fulltune_pixelart
+pixart-loratune_pixelart
+lightning_logs

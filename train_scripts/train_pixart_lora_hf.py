@@ -42,9 +42,11 @@ from torchvision import transforms
 from tqdm.auto import tqdm
 
 import diffusers
-from diffusers import AutoencoderKL, DDPMScheduler, DiffusionPipeline, StableDiffusionPipeline, PixArtAlphaPipeline, \
+from diffusers import AutoencoderKL, DDPMScheduler, DiffusionPipeline, StableDiffusionPipeline, PixArtAlphaPipeline, PixArtSigmaPipeline, \
     Transformer2DModel as Transformer2DModel
     # PixArtTransformer2DModel as Transformer2DModel
+    
+from diffusers.loaders.lora import LoraLoaderMixin
 from transformers import T5EncoderModel, T5Tokenizer
 from diffusers.optimization import get_scheduler
 from diffusers.training_utils import compute_snr
@@ -150,7 +152,7 @@ def parse_args(kwargs=None):
     parser.add_argument(
         "--validate_every",
         type=int,
-        default=100,
+        default=None,
         help=(
             "Run fine-tuning validation every X epochs. The validation process consists of running the prompt"
             " `args.validation_prompt` multiple times: `args.num_validation_images`."
@@ -276,7 +278,7 @@ def parse_args(kwargs=None):
     parser.add_argument(
         "--dataloader_num_workers",
         type=int,
-        default=10,
+        default=8,
         help=(
             "Number of subprocesses to use for data loading. 0 means that the data will be loaded in the main process."
         ),
@@ -329,6 +331,15 @@ def parse_args(kwargs=None):
         ),
     )
     parser.add_argument("--local_rank", type=int, default=-1, help="For distributed training: local_rank")
+    parser.add_argument(
+        "--save_every",
+        type=int,
+        default=500,
+        help=(
+            "Save a checkpoint of the training state every X updates. These checkpoints are only suitable for resuming"
+            " training using `--resume_from_checkpoint`."
+        ),
+    )
     parser.add_argument(
         "--checkpointing_steps",
         type=int,
@@ -657,7 +668,7 @@ def configure_lora(args, transformer, accelerator):
             if accelerator.is_main_process:
                 transformer_ = accelerator.unwrap_model(transformer)
                 lora_state_dict = get_peft_model_state_dict(transformer_, adapter_name="default")
-                StableDiffusionPipeline.save_lora_weights(os.path.join(output_dir, "transformer_lora"), lora_state_dict)
+                LoraLoaderMixin.save_lora_weights(os.path.join(output_dir, "transformer_lora"), lora_state_dict)
                 # save weights in peft format to be able to load them back
                 transformer_.save_pretrained(output_dir)
 
@@ -733,7 +744,7 @@ def save_checkpoint(args, accelerator, transformer, global_step):
     unwrapped_transformer = accelerator.unwrap_model(transformer, keep_fp32_wrapper=False)
     transformer_lora_state_dict = get_peft_model_state_dict(unwrapped_transformer)
 
-    StableDiffusionPipeline.save_lora_weights(
+    LoraLoaderMixin.save_lora_weights(
         save_directory=save_path,
         unet_lora_layers=transformer_lora_state_dict,
         safe_serialization=True,
@@ -926,6 +937,15 @@ def main(args):
                 if global_step % args.checkpointing_steps == 0:
                     if accelerator.is_main_process:
                         save_checkpoint(args, accelerator, transformer, global_step)
+                        
+                if global_step % args.save_every == 0:
+                    if accelerator.is_main_process:
+                        LoraLoaderMixin.save_lora_weights(
+                            save_directory=Path(args.output_dir) / f"saved-{global_step}",
+                            unet_lora_layers=get_peft_model_state_dict(accelerator.unwrap_model(transformer, keep_fp32_wrapper=False)),
+                            safe_serialization=True,
+                        )
+                
 
             logs = {"step_loss": loss.detach().item(), "lr": lr_scheduler.get_last_lr()[0]}
             progress_bar.set_postfix(**logs)
@@ -981,7 +1001,7 @@ def main(args):
         transformer = accelerator.unwrap_model(transformer, keep_fp32_wrapper=False)
         transformer.save_pretrained(args.output_dir)
         lora_state_dict = get_peft_model_state_dict(transformer)
-        StableDiffusionPipeline.save_lora_weights(os.path.join(args.output_dir, "transformer_lora"), lora_state_dict)
+        LoraLoaderMixin.save_lora_weights(os.path.join(args.output_dir, "transformer_lora"), lora_state_dict)
 
     # Final inference
     # Load previous transformer
@@ -1049,7 +1069,42 @@ def mainfire(
         args = parse_args(actualargs)
             
         main(args)
+  
+  
+def mainfire_pixelart(
+        dataset_name="jainr3/diffusiondb-pixelart",
+        output_dir="pixart-loratune_pixelart",
+        pretrained_model_name_or_path="PixArt-alpha/PixArt-Sigma-XL-2-512-MS",
+        validation_prompt="a portrait of a woman",
+        validate_every=250,
+        learning_rate=1e-4,
+        max_grad_norm=1.,
+        num_train_steps=10000,
+        checkpointing_steps=500,
+        save_every=500,
+        # mixed_precision="fp16",
+        train_batch_size=4,
+        gradient_accumulation_steps=2,
+        gradient_checkpointing=True,
+        lora_rank=16,
+        seed=1337,
+        **kwargs,
+    ):
+        fargs = locals().copy()
+        del fargs["kwargs"]
+        
+        actualargs = []
+        for k, v in fargs.items():
+            if v is True:
+                actualargs.append(f"--{k}")
+            else:
+                actualargs.append(f"--{k}={v}")
+        for k, v in kwargs.items():
+            actualargs.append(f"--{k}={v}")
+        args = parse_args(actualargs)
+            
+        main(args)
 
 
 if __name__ == "__main__":
-    fire.Fire(mainfire())
+    fire.Fire(mainfire_pixelart())
