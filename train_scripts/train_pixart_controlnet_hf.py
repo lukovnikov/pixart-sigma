@@ -15,13 +15,15 @@
 """Fine-tuning script for Stable Diffusion for text2image with support for LoRA."""
 
 import argparse
+from copy import deepcopy
+import json
 import logging
 import math
 import os
 import random
 import shutil
 from pathlib import Path
-from typing import List, Union
+from typing import Any, Dict, List, Optional, Union
 
 import datasets
 import fire
@@ -37,16 +39,16 @@ from accelerate.utils import ProjectConfiguration, set_seed
 from datasets import load_dataset
 from huggingface_hub import create_repo, upload_folder
 from packaging import version
-from peft import LoraConfig, get_peft_model_state_dict, get_peft_model, PeftModel
 from torchvision import transforms
 from tqdm.auto import tqdm
 
 import diffusers
-from diffusers import AutoencoderKL, DDPMScheduler, DiffusionPipeline, StableDiffusionPipeline, PixArtAlphaPipeline, PixArtSigmaPipeline, \
+from diffusers import AutoencoderKL, DDPMScheduler, DiffusionPipeline, StableDiffusionPipeline, PixArtSigmaPipeline, PixArtAlphaPipeline, \
     Transformer2DModel as Transformer2DModel
     # PixArtTransformer2DModel as Transformer2DModel
-    
-from diffusers.loaders.lora import LoraLoaderMixin
+from diffusers.models.transformers.pixart_transformer_2d import PixArtTransformer2DModel
+from diffusers.models.modeling_outputs import Transformer2DModelOutput
+from diffusers.utils.import_utils import is_torch_version
 from transformers import T5EncoderModel, T5Tokenizer
 from diffusers.optimization import get_scheduler
 from diffusers.training_utils import compute_snr
@@ -54,6 +56,9 @@ from diffusers.utils import check_min_version, is_wandb_available
 from diffusers.utils.import_utils import is_xformers_available
 
 import wandb
+
+from cocodata import COCOPanopticDataset
+from train_control_ae import ControlSignalEncoder
 
 # Will error if the minimal version of diffusers is not installed. Remove at your own risks.
 check_min_version("0.26.0.dev0")
@@ -91,11 +96,25 @@ These are LoRA adaption weights for {base_model}. The weights were fine-tuned on
 
 ROOTNAME = "PixArt-alpha/PixArt-Sigma-XL-2-1024-MS"
 
-
-def parse_args(kwargs=None):
+def parse_args(inpargs):
     parser = argparse.ArgumentParser(description="Simple example of a training script.")
+    
     parser.add_argument(
-        "--pretrained_model_name_or_path",
+        "--num_control_layers",
+        type=int,
+        default=-1,
+        help="Number of layers of the DiT to copy for ControlNet adaption. If -1, all layers are Control-adapted.",
+    )
+    
+    parser.add_argument(
+        "--control_encoder",
+        type=str,
+        default=None,
+        help="Path to pretrained control encoder",
+    )
+    
+    parser.add_argument(
+        "--pretrained_model_name_or_path", "--model",
         type=str,
         default=None,
         help="Path to pretrained model or model identifier from huggingface.co/models.",
@@ -136,18 +155,13 @@ def parse_args(kwargs=None):
         help="The column of the dataset containing a caption or a list of captions.",
     )
     parser.add_argument(
-        "--validation_prompt", type=str, default=None, help="A prompt that is sampled during training for inference."
+        "--validation_prompt", type=str, default="a stylized portrait drawing the style of thisnewartistA", help="A prompt that is sampled during training for inference."
     )
     parser.add_argument(
         "--num_validation_images",
         type=int,
         default=3,
         help="Number of images that should be generated during validation with `validation_prompt`.",
-    )
-    parser.add_argument(
-        "--validation_guidance_scale", "--valcfg",
-        type=float,
-        default=4.5,
     )
     parser.add_argument(
         "--validate_every",
@@ -168,7 +182,7 @@ def parse_args(kwargs=None):
         ),
     )
     parser.add_argument(
-        "--output_dir", "--outdir",
+        "--output_dir",
         type=str,
         default=None,
         help="The output directory where the model predictions and checkpoints will be written.",
@@ -204,9 +218,9 @@ def parse_args(kwargs=None):
         help="whether to randomly flip images horizontally",
     )
     parser.add_argument(
-        "--train_batch_size", "--batsize", type=int, default=4, help="Batch size (per device) for the training dataloader."
+        "--train_batch_size", type=int, default=4, help="Batch size (per device) for the training dataloader."
     )
-    parser.add_argument("--num_train_steps", "--numsteps", type=int, default=5000)
+    parser.add_argument("--num_train_steps", type=int, default=10000)
     
     parser.add_argument(
         "--gradient_accumulation_steps",
@@ -220,9 +234,9 @@ def parse_args(kwargs=None):
         help="Whether or not to use gradient checkpointing to save memory at the expense of slower backward pass.",
     )
     parser.add_argument(
-        "--learning_rate", "--lr",
+        "--learning_rate",
         type=float,
-        default=1e-4,
+        default=1e-6,
         help="Initial learning rate (after the potential warmup period) to use.",
     )
     parser.add_argument(
@@ -369,12 +383,6 @@ def parse_args(kwargs=None):
     )
     parser.add_argument("--noise_offset", type=float, default=0, help="The scale of noise offset.")
     parser.add_argument(
-        "--lora_rank",
-        type=int,
-        default=4,
-        help="The dimension of the LoRA update matrices.",
-    )
-    parser.add_argument(
         "--micro_conditions",
         default=False,
         action="store_true",
@@ -389,7 +397,7 @@ def parse_args(kwargs=None):
 
     parser.add_argument("--local-rank", type=int, default=-1)
 
-    args = parser.parse_args(kwargs)
+    args = parser.parse_args(inpargs)
     env_local_rank = int(os.environ.get("LOCAL_RANK", -1))
     if env_local_rank != -1 and env_local_rank != args.local_rank:
         args.local_rank = env_local_rank
@@ -397,119 +405,87 @@ def parse_args(kwargs=None):
     return args
 
 
+def validate_args(args):
+    # Sanity checks
+    if args.dataset_name is None and args.train_data_dir is None:
+        raise ValueError("Need either a dataset name or a training folder.")
+
+    if args.proportion_empty_prompts < 0 or args.proportion_empty_prompts > 1:
+        raise ValueError("`--proportion_empty_prompts` must be in the range [0, 1].")
+
+
 DATASET_NAME_MAPPING = {"lambdalabs/pokemon-blip-captions": ("image", "text"),
                         "svjack/pokemon-blip-captions-en-zh": ("image", "en_text")}
 
-
+NUMOBJ = 20
 def load_data(args, accelerator, tokenizer):
     # See Section 3.1. of the paper.
     max_length = args.max_token_length
     
-    # In distributed training, the load_dataset function guarantees that only one local process can concurrently
-    # download the dataset.
-    if args.dataset_name is not None:
-        # Downloading and loading a dataset from the hub.
-        dataset = load_dataset(
-            args.dataset_name,
-            args.dataset_config_name,
-            cache_dir=args.cache_dir,
-            data_dir=args.train_data_dir,
-        )
-    else:
-        data_files = {}
-        if args.train_data_dir is not None:
-            data_files["train"] = os.path.join(args.train_data_dir, "**")
-        dataset = load_dataset(
-            "imagefolder",
-            data_files=data_files,
-            cache_dir=args.cache_dir,
-        )
-        # See more about loading custom images at
-        # https://huggingface.co/docs/datasets/v2.4.0/en/image_load#imagefolder
+    if accelerator.is_main_process:
+        dataset = COCOPanopticDataset(maindir=args.train_data_dir, split="valid", upscale_to=512, max_masks=NUMOBJ)
+    
 
-    # Preprocessing the datasets.
-    # We need to tokenize inputs and targets.
-    column_names = dataset["train"].column_names
-
-    # 6. Get the column names for input/target.
-    dataset_columns = DATASET_NAME_MAPPING.get(args.dataset_name, None)
-    if args.image_column is None:
-        image_column = dataset_columns[0] if dataset_columns is not None else column_names[0]
-    else:
-        image_column = args.image_column
-        if image_column not in column_names:
-            raise ValueError(
-                f"--image_column' value '{args.image_column}' needs to be one of: {', '.join(column_names)}"
-            )
-    if args.caption_column is None:
-        caption_column = dataset_columns[1] if dataset_columns is not None else column_names[1]
-    else:
-        caption_column = args.caption_column
-        if caption_column not in column_names:
-            raise ValueError(
-                f"--caption_column' value '{args.caption_column}' needs to be one of: {', '.join(column_names)}"
-            )
-
+    caption_column = "captions"
+    image_column = "image"
+    
     # Preprocessing the datasets.
     # We need to tokenize input captions and transform the images.
-    def tokenize_captions(examples, is_train=True, proportion_empty_prompts=0., max_length=120):
-        captions = []
-        for caption in examples[caption_column]:
-            if random.random() < proportion_empty_prompts:
-                captions.append("")
-            elif isinstance(caption, str):
-                captions.append(caption)
-            elif isinstance(caption, (list, np.ndarray)):
+    def tokenize_caption(example, is_train=True, proportion_empty_prompts=0., max_length=120):
+        if random.random() < proportion_empty_prompts:
+            caption = ""
+        else:
+            caption = example[caption_column]
+            if isinstance(caption, (list, np.ndarray)):
                 # take a random caption if there are multiple
-                captions.append(random.choice(caption) if is_train else caption[0])
-            else:
-                raise ValueError(
-                    f"Caption column `{caption_column}` should contain either strings or lists of strings."
-                )
-        inputs = tokenizer(captions, max_length=max_length, padding="max_length", truncation=True, return_tensors="pt")
+                caption = random.choice(caption) if is_train else caption[0]
+        inputs = tokenizer(caption, max_length=max_length, padding="max_length", truncation=True, return_tensors="pt")
         return inputs.input_ids, inputs.attention_mask
 
-    # Preprocessing the datasets.
-    train_transforms = transforms.Compose(
-        [
-            transforms.Resize(args.resolution, interpolation=transforms.InterpolationMode.BILINEAR),
-            transforms.CenterCrop(args.resolution) if args.center_crop else transforms.RandomCrop(args.resolution),
-            transforms.RandomHorizontalFlip() if args.random_flip else transforms.Lambda(lambda x: x),
-            transforms.ToTensor(),
-            transforms.Normalize([0.5], [0.5]),
-        ]
-    )
 
-    def preprocess_train(examples):
-        images = [image.convert("RGB") for image in examples[image_column]]
-        examples["pixel_values"] = [train_transforms(image) for image in images]
-        examples["input_ids"], examples['prompt_attention_mask'] = \
-            tokenize_captions(examples, proportion_empty_prompts=args.proportion_empty_prompts, max_length=max_length)
-        return examples
+    def preprocess_train(example):
+        example["input_ids"], example['prompt_attention_mask'] = \
+            tokenize_caption(example, proportion_empty_prompts=args.proportion_empty_prompts, max_length=max_length)
+        return example
 
     with accelerator.main_process_first():
-        if args.max_train_samples is not None:
-            dataset["train"] = dataset["train"].shuffle(seed=args.seed).select(range(args.max_train_samples))
-        # Set the training transforms
-        train_dataset = dataset["train"].with_transform(preprocess_train)
+        dataset.transforms.append(preprocess_train)
 
     def collate_fn(examples):
-        pixel_values = torch.stack([example["pixel_values"] for example in examples])
-        pixel_values = pixel_values.to(memory_format=torch.contiguous_format).float()
-        input_ids = torch.stack([example["input_ids"] for example in examples])
-        prompt_attention_mask = torch.stack([example["prompt_attention_mask"] for example in examples])
-        return {"pixel_values": pixel_values, "input_ids": input_ids, 'prompt_attention_mask': prompt_attention_mask}
+        images = torch.stack([example["image"] for example in examples])
+        images = images.to(memory_format=torch.contiguous_format).float()
+        cond_images = torch.stack([example["cond_image"] for example in examples])
+        cond_images = cond_images.to(memory_format=torch.contiguous_format).float()
+        input_ids = torch.cat([example["input_ids"] for example in examples])
+        prompt_attention_mask = torch.cat([example["prompt_attention_mask"] for example in examples])
+        return {"image": images, "cond_image": cond_images, "input_ids": input_ids, 'prompt_attention_mask': prompt_attention_mask}
 
     # DataLoaders creation:
     train_dataloader = torch.utils.data.DataLoader(
-        train_dataset,
+        dataset,
         shuffle=True,
         collate_fn=collate_fn,
         batch_size=args.train_batch_size,
         num_workers=args.dataloader_num_workers,
     )
     
-    return train_dataset, train_dataloader
+    return dataset, train_dataloader
+
+
+def zero_module(m):
+    for param in m.parameters():
+        torch.fill_(param.data, 0)
+        
+        
+def create_zeroconv2d(inpch, outch, kernel, padding=0):
+    conv = torch.nn.Conv2d(inpch, outch, kernel, padding=padding)
+    zero_module(conv)
+    return conv
+
+def create_zerolin(inpch, outch, padding=0):
+    conv = torch.nn.Linear(inpch, outch)
+    zero_module(conv)
+    return conv
 
 
 def load_model(args, accelerator):
@@ -521,6 +497,12 @@ def load_model(args, accelerator):
         weight_dtype = torch.float16
     elif accelerator.mixed_precision == "bf16":
         weight_dtype = torch.bfloat16
+        
+    # control encoder
+    controlencoder = ControlSignalEncoder(21, 4).to(weight_dtype)
+    controlencoder.load_state_dict(torch.load(Path(args.control_encoder)))
+    controlencoder.zeroconv = create_zeroconv2d(4, 4, 1, padding=0)
+    controlencoder.to(accelerator.device)
 
     # Load scheduler, tokenizer and models.
     noise_scheduler = DDPMScheduler.from_pretrained(ROOTNAME, subfolder="scheduler", torch_dtype=weight_dtype)
@@ -542,7 +524,8 @@ def load_model(args, accelerator):
     for param in transformer.parameters():
         param.requires_grad_(False)
         
-    return transformer, tokenizer, text_encoder, noise_scheduler, vae, weight_dtype
+        
+    return transformer, tokenizer, text_encoder, noise_scheduler, vae, weight_dtype, controlencoder
 
 
 def setup_accelerator(args, logging_dir):
@@ -583,7 +566,7 @@ def setup_accelerator(args, logging_dir):
     return accelerator
 
 
-def configure_optimizer(args, lora_layers, transformer, accelerator):
+def configure_optimizer(args, trainable_layers, transformer, accelerator):
     # Enable TF32 for faster training on Ampere GPUs,
     # cf https://pytorch.org/docs/stable/notes/cuda.html#tensorfloat-32-tf32-on-ampere-devices
     if args.allow_tf32:
@@ -609,7 +592,7 @@ def configure_optimizer(args, lora_layers, transformer, accelerator):
         optimizer_cls = torch.optim.AdamW
 
     optimizer = optimizer_cls(
-        lora_layers,
+        trainable_layers,
         lr=args.learning_rate,
         betas=(args.adam_beta1, args.adam_beta2),
         weight_decay=args.adam_weight_decay,
@@ -618,93 +601,219 @@ def configure_optimizer(args, lora_layers, transformer, accelerator):
     return optimizer
 
 
-def configure_lora(args, transformer, accelerator):
+def adapt_transformer_controlnet(transformer, controlencoder, num_layers=-1, _return_trainable=False):
+    # convert vanilla Transformer model to one that also takes the control signal and has a controlnet branch
+    transformer = PixArtTransformer2DModelWithControlNet.adapt(transformer, controlencoder, num_layers=num_layers)
+    if _return_trainable:
+        trainable = list(transformer.control_blocks.parameters()) + list(transformer.control_encoder.parameters()) + list(transformer.zeroconvs.parameters())        
+        return transformer, trainable
+    else:
+        return transformer
+
+
+class PixArtTransformer2DModelWithControlNet(PixArtTransformer2DModel):
+    def initialize_adapter(self, control_blocks, control_encoder):
+        self.control_blocks = torch.nn.ModuleList(control_blocks)
+        self.control_encoder = control_encoder
+        
+        self.zeroconvs = torch.nn.ModuleList([
+            create_zerolin(block.ff.net[2].out_features, block.ff.net[2].out_features) if block is not None else None \
+                for block in self.control_blocks
+        ])
     
-    lora_config = LoraConfig(
-        r=args.lora_rank,
-        init_lora_weights="gaussian",
-        target_modules=[
-            "to_k",
-            "to_q",
-            "to_v",
-            "to_out.0",
-            "proj_in",
-            "proj_out",
-            "ff.net.0.proj",
-            "ff.net.2",
-            "proj",
-            "linear",
-            "linear_1",
-            "linear_2",
-        ],
-        use_dora=args.use_dora,
-        use_rslora=args.use_rslora
-    )
+    @classmethod
+    def adapt(cls, main, control_encoder, num_layers=-1):
+        control_blocks = [None] * len(main.transformer_blocks)
+        for i in range(len(main.transformer_blocks)):
+            if num_layers == -1 or i < num_layers:
+                control_blocks[i] = deepcopy(main.transformer_blocks[i])
+        
+        main.__class__ = cls
+        main.initialize_adapter(control_blocks, control_encoder)
+        return main
+        
+    def forward(
+        self,
+        hidden_states: torch.Tensor,
+        control_image: torch.Tensor,
+        encoder_hidden_states: Optional[torch.Tensor] = None,
+        timestep: Optional[torch.LongTensor] = None,
+        added_cond_kwargs: Dict[str, torch.Tensor] = None,
+        cross_attention_kwargs: Dict[str, Any] = None,
+        attention_mask: Optional[torch.Tensor] = None,
+        encoder_attention_mask: Optional[torch.Tensor] = None,
+        return_dict: bool = True,
+    ):
+        """
+        The [`PixArtTransformer2DModel`] forward method.
 
-    # Move transformer, vae and text_encoder to device and cast to weight_dtype
-    transformer.to(accelerator.device)
+        Args:
+            hidden_states (`torch.FloatTensor` of shape `(batch size, channel, height, width)`):
+                Input `hidden_states`.
+            encoder_hidden_states (`torch.FloatTensor` of shape `(batch size, sequence len, embed dims)`, *optional*):
+                Conditional embeddings for cross attention layer. If not given, cross-attention defaults to
+                self-attention.
+            timestep (`torch.LongTensor`, *optional*):
+                Used to indicate denoising step. Optional timestep to be applied as an embedding in `AdaLayerNorm`.
+            added_cond_kwargs: (`Dict[str, Any]`, *optional*): Additional conditions to be used as inputs.
+            cross_attention_kwargs ( `Dict[str, Any]`, *optional*):
+                A kwargs dictionary that if specified is passed along to the `AttentionProcessor` as defined under
+                `self.processor` in
+                [diffusers.models.attention_processor](https://github.com/huggingface/diffusers/blob/main/src/diffusers/models/attention_processor.py).
+            attention_mask ( `torch.Tensor`, *optional*):
+                An attention mask of shape `(batch, key_tokens)` is applied to `encoder_hidden_states`. If `1` the mask
+                is kept, otherwise if `0` it is discarded. Mask will be converted into a bias, which adds large
+                negative values to the attention scores corresponding to "discard" tokens.
+            encoder_attention_mask ( `torch.Tensor`, *optional*):
+                Cross-attention mask applied to `encoder_hidden_states`. Two formats supported:
 
-    def cast_training_params(model: Union[torch.nn.Module, List[torch.nn.Module]], dtype=torch.float32):
-        if not isinstance(model, list):
-            model = [model]
-        for m in model:
-            for param in m.parameters():
-                # only upcast trainable parameters into fp32
-                if param.requires_grad:
-                    param.data = param.to(dtype)
+                    * Mask `(batch, sequence_length)` True = keep, False = discard.
+                    * Bias `(batch, 1, sequence_length)` 0 = keep, -10000 = discard.
 
-    transformer = get_peft_model(transformer, lora_config)
-    if args.mixed_precision == "fp16":
-        # only upcast trainable parameters (LoRA) into fp32
-        cast_training_params(transformer, dtype=torch.float32)
+                If `ndim == 2`: will be interpreted as a mask, then converted into a bias consistent with the format
+                above. This bias will be added to the cross-attention scores.
+            return_dict (`bool`, *optional*, defaults to `True`):
+                Whether or not to return a [`~models.unets.unet_2d_condition.UNet2DConditionOutput`] instead of a plain
+                tuple.
 
-    transformer.print_trainable_parameters()
+        Returns:
+            If `return_dict` is True, an [`~models.transformer_2d.Transformer2DModelOutput`] is returned, otherwise a
+            `tuple` where the first element is the sample tensor.
+        """
+        
+        # Encode control image and add to hidden states
+        if self.control_encoder is not None:
+            control_latents = self.control_encoder(control_image)[0]       # control encoder should already have zeroconv on it
+        hidden_states_control = hidden_states + control_latents
+        
+        if self.use_additional_conditions and added_cond_kwargs is None:
+            raise ValueError("`added_cond_kwargs` cannot be None when using additional conditions for `adaln_single`.")
 
-    # 10. Handle saving and loading of checkpoints
-    # `accelerate` 0.16.0 will have better support for customized saving
-    if version.parse(accelerate.__version__) >= version.parse("0.16.0"):
-        # create custom saving & loading hooks so that `accelerator.save_state(...)` serializes in a nice format
-        def save_model_hook(models, weights, output_dir):
-            if accelerator.is_main_process:
-                transformer_ = accelerator.unwrap_model(transformer)
-                lora_state_dict = get_peft_model_state_dict(transformer_, adapter_name="default")
-                LoraLoaderMixin.save_lora_weights(os.path.join(output_dir, "transformer_lora"), lora_state_dict)
-                # save weights in peft format to be able to load them back
-                transformer_.save_pretrained(output_dir)
+        # ensure attention_mask is a bias, and give it a singleton query_tokens dimension.
+        #   we may have done this conversion already, e.g. if we came here via UNet2DConditionModel#forward.
+        #   we can tell by counting dims; if ndim == 2: it's a mask rather than a bias.
+        # expects mask of shape:
+        #   [batch, key_tokens]
+        # adds singleton query_tokens dimension:
+        #   [batch,                    1, key_tokens]
+        # this helps to broadcast it as a bias over attention scores, which will be in one of the following shapes:
+        #   [batch,  heads, query_tokens, key_tokens] (e.g. torch sdp attn)
+        #   [batch * heads, query_tokens, key_tokens] (e.g. xformers or classic attn)
+        if attention_mask is not None and attention_mask.ndim == 2:
+            # assume that mask is expressed as:
+            #   (1 = keep,      0 = discard)
+            # convert mask into a bias that can be added to attention scores:
+            #       (keep = +0,     discard = -10000.0)
+            attention_mask = (1 - attention_mask.to(hidden_states.dtype)) * -10000.0
+            attention_mask = attention_mask.unsqueeze(1)
 
-                for _, model in enumerate(models):
-                    # make sure to pop weight so that corresponding model is not saved again
-                    weights.pop()
+        # convert encoder_attention_mask to a bias the same way we do for attention_mask
+        if encoder_attention_mask is not None and encoder_attention_mask.ndim == 2:
+            encoder_attention_mask = (1 - encoder_attention_mask.to(hidden_states.dtype)) * -10000.0
+            encoder_attention_mask = encoder_attention_mask.unsqueeze(1)
 
-        def load_model_hook(models, input_dir):
-            # load the LoRA into the model
-            transformer_ = accelerator.unwrap_model(transformer)
-            transformer_.load_adapter(input_dir, "default", is_trainable=True)
+        # 1. Input
+        batch_size = hidden_states.shape[0]
+        height, width = (
+            hidden_states.shape[-2] // self.config.patch_size,
+            hidden_states.shape[-1] // self.config.patch_size,
+        )
+        hidden_states = self.pos_embed(hidden_states)       # patching happens here
+        hidden_states_control = self.pos_embed(hidden_states_control)
 
-            for _ in range(len(models)):
-                # pop models so that they are not loaded again
-                models.pop()
+        timestep, embedded_timestep = self.adaln_single(
+            timestep, added_cond_kwargs, batch_size=batch_size, hidden_dtype=hidden_states.dtype
+        )
 
-        accelerator.register_save_state_pre_hook(save_model_hook)
-        accelerator.register_load_state_pre_hook(load_model_hook)
+        if self.caption_projection is not None:
+            encoder_hidden_states = self.caption_projection(encoder_hidden_states)
+            encoder_hidden_states = encoder_hidden_states.view(batch_size, -1, hidden_states.shape[-1])
 
-    if args.enable_xformers_memory_efficient_attention:
-        if is_xformers_available():
-            import xformers
+        # 2. Blocks
+        for block, control_block, zeroconv in zip(self.transformer_blocks, self.control_blocks, self.zeroconvs):
+            if self.training and self.gradient_checkpointing:
 
-            xformers_version = version.parse(xformers.__version__)
-            if xformers_version == version.parse("0.0.16"):
-                logger.warn(
-                    "xFormers 0.0.16 cannot be used for training in some GPUs. If you observe problems during training,"
-                    "please update xFormers to at least 0.0.17. "
-                    "See https://huggingface.co/docs/diffusers/main/en/optimization/xformers for more details."
+                def create_custom_forward(module, return_dict=None):
+                    def custom_forward(*inputs):
+                        if return_dict is not None:
+                            return module(*inputs, return_dict=return_dict)
+                        else:
+                            return module(*inputs)
+
+                    return custom_forward
+
+                ckpt_kwargs: Dict[str, Any] = {"use_reentrant": False} if is_torch_version(">=", "1.11.0") else {}
+                hidden_states = torch.utils.checkpoint.checkpoint(
+                    create_custom_forward(block),
+                    hidden_states,
+                    attention_mask,
+                    encoder_hidden_states,
+                    encoder_attention_mask,
+                    timestep,
+                    cross_attention_kwargs,
+                    None,
+                    **ckpt_kwargs,
                 )
-            transformer.enable_xformers_memory_efficient_attention()
-        else:
-            raise ValueError("xformers is not available. Make sure it is installed correctly")
+                if control_block is not None:
+                    hidden_states_control = torch.utils.checkpoint.checkpoint(
+                        create_custom_forward(control_block),
+                        hidden_states_control,
+                        attention_mask,
+                        encoder_hidden_states,
+                        encoder_attention_mask,
+                        timestep,
+                        cross_attention_kwargs,
+                        None,
+                        **ckpt_kwargs,
+                    )
+                # if zeroconv is not None:
+                    hidden_states = hidden_states + zeroconv(hidden_states_control)
+            else:
+                hidden_states = block(
+                    hidden_states,
+                    attention_mask=attention_mask,
+                    encoder_hidden_states=encoder_hidden_states,
+                    encoder_attention_mask=encoder_attention_mask,
+                    timestep=timestep,
+                    cross_attention_kwargs=cross_attention_kwargs,
+                    class_labels=None,
+                )
+                if control_block is not None:
+                    hidden_states_control = control_block(
+                        hidden_states_control,
+                        attention_mask=attention_mask,
+                        encoder_hidden_states=encoder_hidden_states,
+                        encoder_attention_mask=encoder_attention_mask,
+                        timestep=timestep,
+                        cross_attention_kwargs=cross_attention_kwargs,
+                        class_labels=None,
+                    )
+                # if zeroconv is not None:
+                    hidden_states = hidden_states + zeroconv(hidden_states_control)
 
-    lora_layers = list(filter(lambda p: p.requires_grad, transformer.parameters()))
-    return lora_layers
+        # 3. Output
+        shift, scale = (
+            self.scale_shift_table[None] + embedded_timestep[:, None].to(self.scale_shift_table.device)
+        ).chunk(2, dim=1)
+        hidden_states = self.norm_out(hidden_states)
+        # Modulation
+        hidden_states = hidden_states * (1 + scale.to(hidden_states.device)) + shift.to(hidden_states.device)
+        hidden_states = self.proj_out(hidden_states)
+        hidden_states = hidden_states.squeeze(1)
+
+        # unpatchify
+        hidden_states = hidden_states.reshape(
+            shape=(-1, height, width, self.config.patch_size, self.config.patch_size, self.out_channels)
+        )
+        hidden_states = torch.einsum("nhwpqc->nchpwq", hidden_states)
+        output = hidden_states.reshape(
+            shape=(-1, self.out_channels, height * self.config.patch_size, width * self.config.patch_size)
+        )
+
+        if not return_dict:
+            return (output,)
+
+        return Transformer2DModelOutput(sample=output)
 
 
 def configure_lr_scheduler(args, train_dataloader, optimizer, accelerator):
@@ -718,7 +827,6 @@ def configure_lr_scheduler(args, train_dataloader, optimizer, accelerator):
 
 
 def save_checkpoint(args, accelerator, transformer, global_step):
-    # _before_ saving state, check if this save would set us over the `checkpoints_total_limit`
     if args.checkpoints_total_limit is not None:
         checkpoints = os.listdir(args.output_dir)
         checkpoints = [d for d in checkpoints if d.startswith("checkpoint")]
@@ -741,25 +849,50 @@ def save_checkpoint(args, accelerator, transformer, global_step):
     save_path = os.path.join(args.output_dir, f"checkpoint-{global_step}")
     accelerator.save_state(save_path)
 
-    unwrapped_transformer = accelerator.unwrap_model(transformer, keep_fp32_wrapper=False)
-    transformer_lora_state_dict = get_peft_model_state_dict(unwrapped_transformer)
+    # unwrapped_transformer = accelerator.unwrap_model(transformer, keep_fp32_wrapper=False)
 
-    LoraLoaderMixin.save_lora_weights(
-        save_directory=save_path,
-        unet_lora_layers=transformer_lora_state_dict,
-        safe_serialization=True,
-    )
+    # unwrapped_transformer.save_pretrained(
+    #     save_directory=save_path,
+    #     safe_serialization=True,
+    # )
 
     logger.info(f"Saved state to {save_path}")
+    
+    
+def save_dit(args, accelerator, transformer, global_step):
+    save_directory = Path(args.output_dir) / f"saved-{global_step}"
+    transformer = accelerator.unwrap_model(transformer)
+    config = deepcopy(transformer.config)
+    config["num_control_layers"] = len(block if block is not None transformer.control_blocks
+    json.dump(config)
+    transformer.save_config(save_directory)
+    statedict = transformer.state_dict()
+    for k, v in statedict.items():
+        if not (k.startswith("control_blocks") or k.startswith("control_encoder") or k.startswith("zeroconvs")):
+            del statedict[k]
+    torch.save(statedict, save_directory / "controlnet_weights.pt")
+    
+    
+def load_dit(savedir, weight_dtype):
+    # TODO 
+    dir = Path(savedir)
+    config = json.load(dir / "config.json")
+    modelname = config["_name_or_path"]
+    
+    # load pretrained transformer
+    transformer = Transformer2DModel.from_pretrained(modelname, subfolder="transformer", torch_dtype=weight_dtype)
+
+    # create control encoder
+    controlencoder = ControlSignalEncoder(21, 4).to(weight_dtype)
+    controlencoder.zeroconv = create_zeroconv2d(4, 4, 1, padding=0)
+    
+    adapted_transformer = adapt_transformer_controlnet(transformer, controlencoder, num_layers)
 
 
-def validate_args(args):
-    # Sanity checks
-    if args.dataset_name is None and args.train_data_dir is None:
-        raise ValueError("Need either a dataset name or a training folder.")
+class Validator:
+    # TODO
+    pass
 
-    if args.proportion_empty_prompts < 0 or args.proportion_empty_prompts > 1:
-        raise ValueError("`--proportion_empty_prompts` must be in the range [0, 1].")
 
 
 def main(args):
@@ -768,9 +901,9 @@ def main(args):
     logging_dir = Path(args.output_dir, args.logging_dir)
 
     accelerator = setup_accelerator(args, logging_dir)
-    transformer, tokenizer, text_encoder, noise_scheduler, vae, weight_dtype = load_model(args, accelerator)
-    lora_layers = configure_lora(args, transformer, accelerator)
-    optimizer = configure_optimizer(args, lora_layers, transformer, accelerator)
+    transformer, tokenizer, text_encoder, noise_scheduler, vae, weight_dtype, controlencoder = load_model(args, accelerator)
+    transformer, trainable_layers = adapt_transformer_controlnet(transformer, controlencoder, num_layers=args.num_control_layers, _return_trainable=True)
+    optimizer = configure_optimizer(args, trainable_layers, transformer, accelerator)
     train_dataset, train_dataloader = load_data(args, accelerator, tokenizer)
     lr_scheduler = configure_lr_scheduler(args, train_dataloader, optimizer, accelerator)
 
@@ -782,7 +915,7 @@ def main(args):
     # We need to initialize the trackers we use, and also store our configuration.
     # The trackers initializes automatically on the main process.
     if accelerator.is_main_process:
-        accelerator.init_trackers("pixart-lora-tune", config=vars(args))
+        accelerator.init_trackers("pixart-fine-tune", config=vars(args))
 
 
 
@@ -815,7 +948,7 @@ def main(args):
             args.resume_from_checkpoint = None
             initial_global_step = 0
         else:
-            accelerator.print(f"Resuming from checkpoint {path}")
+            accelerator.print(f"\n Resuming from checkpoint {path} \n")
             accelerator.load_state(os.path.join(args.output_dir, path))
             global_step = int(path.split("-")[1])
 
@@ -830,11 +963,10 @@ def main(args):
         # Only show the progress bar once on each machine.
         disable=not accelerator.is_local_main_process,
     )
-    
-    train_dl_iter = iter(train_dataloader)
 
-    # for _ in range(global_step, args.num_train_steps):
-    while True:
+    train_dl_iter = iter(train_dataloader)
+    
+    for _ in range(global_step, args.num_train_steps):
         transformer.train()
         train_loss = 0.0
         
@@ -845,10 +977,13 @@ def main(args):
             train_dl_iter = iter(train_dataloader)
             batch = next(train_dl_iter)
         
+        # do step
         with accelerator.accumulate(transformer):
             # Convert images to latent space
-            latents = vae.encode(batch["pixel_values"].to(dtype=weight_dtype)).latent_dist.sample()
+            latents = vae.encode(batch["image"].to(dtype=weight_dtype)).latent_dist.sample()
             latents = latents * vae.config.scaling_factor
+            
+            control_image = batch["cond_image"]
 
             # Sample noise that we'll add to the latents
             noise = torch.randn_like(latents)
@@ -893,6 +1028,7 @@ def main(args):
 
             # Predict the noise residual and compute loss
             model_pred = transformer(noisy_latents,
+                                     control_image=control_image,
                                         encoder_hidden_states=prompt_embeds,
                                         encoder_attention_mask=prompt_attention_mask,
                                         timestep=timesteps,
@@ -922,7 +1058,7 @@ def main(args):
             # Backpropagate
             accelerator.backward(loss)
             if accelerator.sync_gradients:
-                params_to_clip = lora_layers
+                params_to_clip = trainable_layers
                 accelerator.clip_grad_norm_(params_to_clip, args.max_grad_norm)
             optimizer.step()
             lr_scheduler.step()
@@ -937,22 +1073,18 @@ def main(args):
 
                 if global_step % args.checkpointing_steps == 0:
                     if accelerator.is_main_process:
+                        # _before_ saving state, check if this save would set us over the `checkpoints_total_limit`
                         save_checkpoint(args, accelerator, transformer, global_step)
                         
                 if global_step % args.save_every == 0:
                     if accelerator.is_main_process:
-                        LoraLoaderMixin.save_lora_weights(
-                            save_directory=Path(args.output_dir) / f"saved-{global_step}",
-                            unet_lora_layers=get_peft_model_state_dict(accelerator.unwrap_model(transformer, keep_fp32_wrapper=False)),
-                            safe_serialization=True,
-                        )
+                        save_dit(args, accelerator, transformer, global_step)
                 
 
             logs = {"step_loss": loss.detach().item(), "lr": lr_scheduler.get_last_lr()[0]}
             progress_bar.set_postfix(**logs)
 
             if global_step >= args.num_train_steps:
-                print(f"!!!!! Maximum number of steps reached: {global_step}/{args.num_train_steps}")
                 break
 
         if accelerator.is_main_process:
@@ -1002,16 +1134,16 @@ def main(args):
     if accelerator.is_main_process:
         transformer = accelerator.unwrap_model(transformer, keep_fp32_wrapper=False)
         transformer.save_pretrained(args.output_dir)
-        lora_state_dict = get_peft_model_state_dict(transformer)
-        LoraLoaderMixin.save_lora_weights(os.path.join(args.output_dir, "transformer_lora"), lora_state_dict)
+        # lora_state_dict = get_peft_model_state_dict(transformer)
+        # StableDiffusionPipeline.save_lora_weights(os.path.join(args.output_dir, "transformer_lora"), lora_state_dict)
 
     # Final inference
     # Load previous transformer
     transformer = Transformer2DModel.from_pretrained(
         args.pretrained_model_name_or_path, subfolder='transformer', torch_dtype=weight_dtype
     )
-    # load lora weight
-    transformer = PeftModel.from_pretrained(transformer, args.output_dir)
+    # # load lora weight
+    # transformer = PeftModel.from_pretrained(transformer, args.output_dir)
     # Load previous pipeline
     pipeline = DiffusionPipeline.from_pretrained(
         ROOTNAME, transformer=transformer, text_encoder=text_encoder, vae=vae,
@@ -1047,17 +1179,15 @@ def main(args):
                     )
 
     accelerator.end_training()
-    
-    
+
+
 def mainfire(
         train_data_dir="/USERSPACE/lukovdg1/artdata/finnfrei/train/",
         output_dir="pixart-model-finetuned-lora-finnfrei",
         pretrained_model_name_or_path="PixArt-alpha/PixArt-Sigma-XL-2-512-MS",
-        validation_prompt="a stylized portrait drawing the style of thisnewartistA",
-        learning_rate=1e-4,
-        validation_guidance_scale=3.0,
-        lora_rank=16,
-        num_train_steps=5000,
+        validation_prompt="a portrait of a woman",
+        learning_rate=1e-5,
+        num_train_steps=10000,
         **kwargs,
     ):
         fargs = locals().copy()
@@ -1071,24 +1201,24 @@ def mainfire(
         args = parse_args(actualargs)
             
         main(args)
-  
-  
+        
+        
 def mainfire_pixelart(
-        dataset_name="jainr3/diffusiondb-pixelart",
-        output_dir="/USERSPACE/lukovdg1/pixart-sigma/train_scripts/pixart-loratune_pixelart",
+        train_data_dir="/USERSPACE/lukovdg1/coco2017",
+        output_dir="train_scripts/experiments/pixart_controlnet_coco",
         pretrained_model_name_or_path="PixArt-alpha/PixArt-Sigma-XL-2-512-MS",
-        validation_prompt="a portrait of a woman",
+        control_encoder="/USERSPACE/lukovdg1/pixart-sigma/train_scripts/experiments/control_encoder.pth",
         validate_every=250,
-        learning_rate=1e-4,
+        learning_rate=1e-5,
         max_grad_norm=1.,
         num_train_steps=10000,
         checkpointing_steps=500,
         save_every=500,
         # mixed_precision="fp16",
-        train_batch_size=4,
-        gradient_accumulation_steps=2,
-        gradient_checkpointing=True,
-        lora_rank=16,
+        train_batch_size=2,
+        gradient_accumulation_steps=4,
+        # gradient_checkpointing=True,
+        num_control_layers=8,
         seed=1337,
         **kwargs,
     ):
@@ -1106,10 +1236,14 @@ def mainfire_pixelart(
                 actualargs.append(f"--{k}={v}")
         for k, v in kwargs.items():
             actualargs.append(f"--{k}={v}")
-            
         args = parse_args(actualargs)
             
         main(args)
+
+
+# TODO: Implement custom pipeline (PixArtSigmaControlNetPipeline)
+# TODO: Implement validator that uses this pipeline
+# TODO: Implement saving and loading of model and checkpoints
 
 
 if __name__ == "__main__":

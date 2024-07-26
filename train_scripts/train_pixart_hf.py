@@ -834,7 +834,7 @@ def main(args):
                         
                 if global_step % args.save_every == 0:
                     if accelerator.is_main_process:
-                        accelerator.unwrap_model(transformer).save_pretrained(Path(args.output_dir) / f"dit-{global_step}")
+                        accelerator.unwrap_model(transformer).save_pretrained(Path(args.output_dir) / f"saved-{global_step}")
                 
 
             logs = {"step_loss": loss.detach().item(), "lr": lr_scheduler.get_last_lr()[0]}
@@ -978,7 +978,10 @@ def mainfire_pixelart(
         **kwargs,
     ):
         fargs = locals().copy()
-        del fargs["kwargs"]
+        dels = ["kwargs", "ModuleType", "_python_view_image_mod"]
+        for d in dels:
+            if d in fargs:
+                del fargs[d]
         
         actualargs = []
         for k, v in fargs.items():
