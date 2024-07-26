@@ -49,12 +49,15 @@ class ControlSignalEncoder(torch.nn.Module):
             torch.nn.Conv2d(256, outchannels*2, 1, padding=0),
             # torch.nn.Tanh(),
         )
+        self.zeroconv = None
         
     def forward(self, x):
         x = x.float()
         for layer in self.layers:
             x = layer(x)
         mu, logvar = x[:, :self.outchannels], x[:, self.outchannels:]
+        if self.zeroconv is not None:
+            mu = self.zeroconv(mu)
         return mu, logvar
     
 
@@ -213,7 +216,7 @@ def objectmasks_to_pil(x, colors):
     return ret
     
     
-def main(epochs=100, gpu=0, outdir="control_ae_output", batsize=32, lamda=0.1, plotevery=200):
+def main(epochs=100, gpu=0, outdir="_test_control_ae_output", batsize=32, lamda=0.1, plotevery=200):
     NUMOBJ = 20
     model = ControlSignalVAE(pixelchannels=NUMOBJ+1, lamda=lamda)
     

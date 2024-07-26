@@ -164,7 +164,7 @@ docker/cache/huggingface
 
 wandb/
 train_scripts/**/*-finetuned-*
-control_ae_output*
+*control_ae_output*
 pixart-fulltune_pixelart
 pixart-loratune_pixelart
 lightning_logs

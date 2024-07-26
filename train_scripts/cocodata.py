@@ -153,14 +153,13 @@ class COCOPanopticDataset(Dataset):
                  examples=None, mergeregions=False,  # mergeregions?
                  regiondrop=False,           # if False, dropping examples with too many masks, if True: keeping all examples and dropping randomly some masks, if float: acts like True, but also drops some masks with the given number as drop probability
                  casmode=None, simpleencode=False, limitpadding=False,
-                 tokenizer_version="openai/clip-vit-large-patch14",
+                 tokenizer="openai/clip-vit-large-patch14",
                  usescribbles=False, usecanny=False):
         super().__init__()
         assert examples is None or maindir is None      # provide either a directory or a list of already made examples
         self.maindir = maindir
         self.n = 0
-        self.tokenizer_version = tokenizer_version
-        self.load_tokenizer()
+        self.load_tokenizer(tokenizer)
         
         self.casmode = casmode
         
@@ -292,6 +291,8 @@ class COCOPanopticDataset(Dataset):
         print(f"Too few regions: {numtoofewregions}")
         print(f"Too small: {numtoosmall}")
         
+        self.transforms = []
+        
     def filter_ids(self, ids):
         newselfexamples = []
         for res, examples in self.examples:
@@ -352,8 +353,11 @@ class COCOPanopticDataset(Dataset):
             
         return panoptic_category_db, panoptic_db
                 
-    def load_tokenizer(self):
-        self.tokenizer = CLIPTokenizer.from_pretrained(self.tokenizer_version)
+    def load_tokenizer(self, tokenizer):
+        if isinstance(tokenizer, str):
+            self.tokenizer = CLIPTokenizer.from_pretrained(tokenizer)
+        else:
+            self.tokenizer = tokenizer
 
     def __getstate__(self):
         ret = copy(self.__dict__)
@@ -372,7 +376,7 @@ class COCOPanopticDataset(Dataset):
                                   return_overflowing_tokens=False,
                                   truncation=True,
                                   return_tensors="pt")
-        return tokenized["input_ids"]
+        return tokenized.input_ids, tokenized.attention_mask
     
     def untokenize(self, x, tokenizer=None):
         tokenizer = tokenizer if tokenizer is not None else self.tokenizer
@@ -513,13 +517,18 @@ class COCOPanopticDataset(Dataset):
             
         imgtensor = imgtensor * 2 - 1.
         
-        return {"image": imgtensor, 
+        ret = {"image": imgtensor, 
                 "cond_image": cond_imgtensor,
                 "captions": captions,
                 # "layerids": layerids,
                 # "encoder_layerids": encoder_layerids,
                 # "regionmasks": downmasktensors
                 }
+        
+        for transform in self.transforms:
+            ret = transform(ret)
+            
+        return ret
     
     
 

@@ -1073,7 +1073,7 @@ def mainfire(
   
 def mainfire_pixelart(
         dataset_name="jainr3/diffusiondb-pixelart",
-        output_dir="pixart-loratune_pixelart",
+        output_dir="/USERSPACE/lukovdg1/pixart-sigma/train_scripts/pixart-loratune_pixelart",
         pretrained_model_name_or_path="PixArt-alpha/PixArt-Sigma-XL-2-512-MS",
         validation_prompt="a portrait of a woman",
         validate_every=250,
@@ -1101,10 +1101,11 @@ def mainfire_pixelart(
                 actualargs.append(f"--{k}={v}")
         for k, v in kwargs.items():
             actualargs.append(f"--{k}={v}")
+            
         args = parse_args(actualargs)
             
         main(args)
 
 
 if __name__ == "__main__":
-    fire.Fire(mainfire_pixelart())
+    fire.Fire(mainfire_pixelart)
