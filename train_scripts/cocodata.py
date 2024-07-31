@@ -420,10 +420,16 @@ class COCOPanopticDataset(Dataset):
         layerids = []
         encoder_layerids = []
         # regioncounts = []
+        image_paths = []
+        seg_paths = []
         
         for example in examples:
             images.append(example["image"])   # concat images
             cond_images.append(example["cond_image"])
+            
+            image_paths.append(example["image_path"])
+            seg_paths.append(example["seg_path"])
+            
             captions.append(torch.cat(example["captions"], 0))   # batchify captions
             # regioncounts.append(len(example["captions"]))  # keep track of the number of regions per example
             layerids.append(torch.cat(example["layerids"], 0))   # layer ids
@@ -454,13 +460,16 @@ class COCOPanopticDataset(Dataset):
         # DONE: passing layer ids: prepare a data structure for converting from current dynamically flat caption format to (batsize, seqlen, hdim)
         # DONE: return (batsize, seqlen) tensor that specifies if the token is part of global description or local description
         # DONE: provide conditioning image for ControlNet
-        return {"image": rearrange(imagebatch, 'b c h w -> b h w c'), 
+        ret = {"image": rearrange(imagebatch, 'b c h w -> b h w c'), 
                 "cond_image": rearrange(cond_imagebatch, 'b c h w -> b h w c'),
                 "caption": captionbatch, 
                 "layerids": layeridsbatch, 
                 "encoder_layerids": encoder_layeridsbatch,
                 "regionmasks": batched_regionmasks, 
-                "captiontypes": captiontypes}
+                "captiontypes": captiontypes,
+                "image_paths": image_paths,
+                "seg_paths": seg_paths,
+                }
         
         
     def materialize_example(self, example):
@@ -520,6 +529,8 @@ class COCOPanopticDataset(Dataset):
         ret = {"image": imgtensor, 
                 "cond_image": cond_imgtensor,
                 "captions": captions,
+                "image_path": example.image_path,
+                "seg_path": example.seg_path,
                 # "layerids": layerids,
                 # "encoder_layerids": encoder_layerids,
                 # "regionmasks": downmasktensors

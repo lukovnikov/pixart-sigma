@@ -46,9 +46,9 @@ import diffusers
 from diffusers import AutoencoderKL, DDPMScheduler, DiffusionPipeline, StableDiffusionPipeline, PixArtSigmaPipeline, PixArtAlphaPipeline, \
     Transformer2DModel as Transformer2DModel
     # PixArtTransformer2DModel as Transformer2DModel
-from diffusers.models.transformers.pixart_transformer_2d import PixArtTransformer2DModel
-from diffusers.models.modeling_outputs import Transformer2DModelOutput
-from diffusers.utils.import_utils import is_torch_version
+
+from pixart_sigma_controlnet import PixArtSigmaControlNetPipeline, PixArtTransformer2DModelWithControlNet, create_zeroconv2d
+    
 from transformers import T5EncoderModel, T5Tokenizer
 from diffusers.optimization import get_scheduler
 from diffusers.training_utils import compute_snr
@@ -472,22 +472,6 @@ def load_data(args, accelerator, tokenizer):
     return dataset, train_dataloader
 
 
-def zero_module(m):
-    for param in m.parameters():
-        torch.fill_(param.data, 0)
-        
-        
-def create_zeroconv2d(inpch, outch, kernel, padding=0):
-    conv = torch.nn.Conv2d(inpch, outch, kernel, padding=padding)
-    zero_module(conv)
-    return conv
-
-def create_zerolin(inpch, outch, padding=0):
-    conv = torch.nn.Linear(inpch, outch)
-    zero_module(conv)
-    return conv
-
-
 def load_model(args, accelerator):
     # For mixed precision training we cast all non-trainable weights
     # (vae, non-lora text_encoder and non-lora transformer) to half-precision
@@ -611,211 +595,6 @@ def adapt_transformer_controlnet(transformer, controlencoder, num_layers=-1, _re
         return transformer
 
 
-class PixArtTransformer2DModelWithControlNet(PixArtTransformer2DModel):
-    def initialize_adapter(self, control_blocks, control_encoder):
-        self.control_blocks = torch.nn.ModuleList(control_blocks)
-        self.control_encoder = control_encoder
-        
-        self.zeroconvs = torch.nn.ModuleList([
-            create_zerolin(block.ff.net[2].out_features, block.ff.net[2].out_features) if block is not None else None \
-                for block in self.control_blocks
-        ])
-    
-    @classmethod
-    def adapt(cls, main, control_encoder, num_layers=-1):
-        control_blocks = [None] * len(main.transformer_blocks)
-        for i in range(len(main.transformer_blocks)):
-            if num_layers == -1 or i < num_layers:
-                control_blocks[i] = deepcopy(main.transformer_blocks[i])
-        
-        main.__class__ = cls
-        main.initialize_adapter(control_blocks, control_encoder)
-        return main
-        
-    def forward(
-        self,
-        hidden_states: torch.Tensor,
-        control_image: torch.Tensor,
-        encoder_hidden_states: Optional[torch.Tensor] = None,
-        timestep: Optional[torch.LongTensor] = None,
-        added_cond_kwargs: Dict[str, torch.Tensor] = None,
-        cross_attention_kwargs: Dict[str, Any] = None,
-        attention_mask: Optional[torch.Tensor] = None,
-        encoder_attention_mask: Optional[torch.Tensor] = None,
-        return_dict: bool = True,
-    ):
-        """
-        The [`PixArtTransformer2DModel`] forward method.
-
-        Args:
-            hidden_states (`torch.FloatTensor` of shape `(batch size, channel, height, width)`):
-                Input `hidden_states`.
-            encoder_hidden_states (`torch.FloatTensor` of shape `(batch size, sequence len, embed dims)`, *optional*):
-                Conditional embeddings for cross attention layer. If not given, cross-attention defaults to
-                self-attention.
-            timestep (`torch.LongTensor`, *optional*):
-                Used to indicate denoising step. Optional timestep to be applied as an embedding in `AdaLayerNorm`.
-            added_cond_kwargs: (`Dict[str, Any]`, *optional*): Additional conditions to be used as inputs.
-            cross_attention_kwargs ( `Dict[str, Any]`, *optional*):
-                A kwargs dictionary that if specified is passed along to the `AttentionProcessor` as defined under
-                `self.processor` in
-                [diffusers.models.attention_processor](https://github.com/huggingface/diffusers/blob/main/src/diffusers/models/attention_processor.py).
-            attention_mask ( `torch.Tensor`, *optional*):
-                An attention mask of shape `(batch, key_tokens)` is applied to `encoder_hidden_states`. If `1` the mask
-                is kept, otherwise if `0` it is discarded. Mask will be converted into a bias, which adds large
-                negative values to the attention scores corresponding to "discard" tokens.
-            encoder_attention_mask ( `torch.Tensor`, *optional*):
-                Cross-attention mask applied to `encoder_hidden_states`. Two formats supported:
-
-                    * Mask `(batch, sequence_length)` True = keep, False = discard.
-                    * Bias `(batch, 1, sequence_length)` 0 = keep, -10000 = discard.
-
-                If `ndim == 2`: will be interpreted as a mask, then converted into a bias consistent with the format
-                above. This bias will be added to the cross-attention scores.
-            return_dict (`bool`, *optional*, defaults to `True`):
-                Whether or not to return a [`~models.unets.unet_2d_condition.UNet2DConditionOutput`] instead of a plain
-                tuple.
-
-        Returns:
-            If `return_dict` is True, an [`~models.transformer_2d.Transformer2DModelOutput`] is returned, otherwise a
-            `tuple` where the first element is the sample tensor.
-        """
-        
-        # Encode control image and add to hidden states
-        if self.control_encoder is not None:
-            control_latents = self.control_encoder(control_image)[0]       # control encoder should already have zeroconv on it
-        hidden_states_control = hidden_states + control_latents
-        
-        if self.use_additional_conditions and added_cond_kwargs is None:
-            raise ValueError("`added_cond_kwargs` cannot be None when using additional conditions for `adaln_single`.")
-
-        # ensure attention_mask is a bias, and give it a singleton query_tokens dimension.
-        #   we may have done this conversion already, e.g. if we came here via UNet2DConditionModel#forward.
-        #   we can tell by counting dims; if ndim == 2: it's a mask rather than a bias.
-        # expects mask of shape:
-        #   [batch, key_tokens]
-        # adds singleton query_tokens dimension:
-        #   [batch,                    1, key_tokens]
-        # this helps to broadcast it as a bias over attention scores, which will be in one of the following shapes:
-        #   [batch,  heads, query_tokens, key_tokens] (e.g. torch sdp attn)
-        #   [batch * heads, query_tokens, key_tokens] (e.g. xformers or classic attn)
-        if attention_mask is not None and attention_mask.ndim == 2:
-            # assume that mask is expressed as:
-            #   (1 = keep,      0 = discard)
-            # convert mask into a bias that can be added to attention scores:
-            #       (keep = +0,     discard = -10000.0)
-            attention_mask = (1 - attention_mask.to(hidden_states.dtype)) * -10000.0
-            attention_mask = attention_mask.unsqueeze(1)
-
-        # convert encoder_attention_mask to a bias the same way we do for attention_mask
-        if encoder_attention_mask is not None and encoder_attention_mask.ndim == 2:
-            encoder_attention_mask = (1 - encoder_attention_mask.to(hidden_states.dtype)) * -10000.0
-            encoder_attention_mask = encoder_attention_mask.unsqueeze(1)
-
-        # 1. Input
-        batch_size = hidden_states.shape[0]
-        height, width = (
-            hidden_states.shape[-2] // self.config.patch_size,
-            hidden_states.shape[-1] // self.config.patch_size,
-        )
-        hidden_states = self.pos_embed(hidden_states)       # patching happens here
-        hidden_states_control = self.pos_embed(hidden_states_control)
-
-        timestep, embedded_timestep = self.adaln_single(
-            timestep, added_cond_kwargs, batch_size=batch_size, hidden_dtype=hidden_states.dtype
-        )
-
-        if self.caption_projection is not None:
-            encoder_hidden_states = self.caption_projection(encoder_hidden_states)
-            encoder_hidden_states = encoder_hidden_states.view(batch_size, -1, hidden_states.shape[-1])
-
-        # 2. Blocks
-        for block, control_block, zeroconv in zip(self.transformer_blocks, self.control_blocks, self.zeroconvs):
-            if self.training and self.gradient_checkpointing:
-
-                def create_custom_forward(module, return_dict=None):
-                    def custom_forward(*inputs):
-                        if return_dict is not None:
-                            return module(*inputs, return_dict=return_dict)
-                        else:
-                            return module(*inputs)
-
-                    return custom_forward
-
-                ckpt_kwargs: Dict[str, Any] = {"use_reentrant": False} if is_torch_version(">=", "1.11.0") else {}
-                hidden_states = torch.utils.checkpoint.checkpoint(
-                    create_custom_forward(block),
-                    hidden_states,
-                    attention_mask,
-                    encoder_hidden_states,
-                    encoder_attention_mask,
-                    timestep,
-                    cross_attention_kwargs,
-                    None,
-                    **ckpt_kwargs,
-                )
-                if control_block is not None:
-                    hidden_states_control = torch.utils.checkpoint.checkpoint(
-                        create_custom_forward(control_block),
-                        hidden_states_control,
-                        attention_mask,
-                        encoder_hidden_states,
-                        encoder_attention_mask,
-                        timestep,
-                        cross_attention_kwargs,
-                        None,
-                        **ckpt_kwargs,
-                    )
-                # if zeroconv is not None:
-                    hidden_states = hidden_states + zeroconv(hidden_states_control)
-            else:
-                hidden_states = block(
-                    hidden_states,
-                    attention_mask=attention_mask,
-                    encoder_hidden_states=encoder_hidden_states,
-                    encoder_attention_mask=encoder_attention_mask,
-                    timestep=timestep,
-                    cross_attention_kwargs=cross_attention_kwargs,
-                    class_labels=None,
-                )
-                if control_block is not None:
-                    hidden_states_control = control_block(
-                        hidden_states_control,
-                        attention_mask=attention_mask,
-                        encoder_hidden_states=encoder_hidden_states,
-                        encoder_attention_mask=encoder_attention_mask,
-                        timestep=timestep,
-                        cross_attention_kwargs=cross_attention_kwargs,
-                        class_labels=None,
-                    )
-                # if zeroconv is not None:
-                    hidden_states = hidden_states + zeroconv(hidden_states_control)
-
-        # 3. Output
-        shift, scale = (
-            self.scale_shift_table[None] + embedded_timestep[:, None].to(self.scale_shift_table.device)
-        ).chunk(2, dim=1)
-        hidden_states = self.norm_out(hidden_states)
-        # Modulation
-        hidden_states = hidden_states * (1 + scale.to(hidden_states.device)) + shift.to(hidden_states.device)
-        hidden_states = self.proj_out(hidden_states)
-        hidden_states = hidden_states.squeeze(1)
-
-        # unpatchify
-        hidden_states = hidden_states.reshape(
-            shape=(-1, height, width, self.config.patch_size, self.config.patch_size, self.out_channels)
-        )
-        hidden_states = torch.einsum("nhwpqc->nchpwq", hidden_states)
-        output = hidden_states.reshape(
-            shape=(-1, self.out_channels, height * self.config.patch_size, width * self.config.patch_size)
-        )
-
-        if not return_dict:
-            return (output,)
-
-        return Transformer2DModelOutput(sample=output)
-
-
 def configure_lr_scheduler(args, train_dataloader, optimizer, accelerator):
     lr_scheduler = get_scheduler(
         args.lr_scheduler,
@@ -860,23 +639,38 @@ def save_checkpoint(args, accelerator, transformer, global_step):
     
     
 def save_dit(args, accelerator, transformer, global_step):
-    save_directory = Path(args.output_dir) / f"saved-{global_step}"
-    transformer = accelerator.unwrap_model(transformer)
+    return _save_dit(transformer, accelerator, args, global_step)
+
+
+def save_dit_path(transformer, path):
+    return _save_dit(transformer, savedir=path)
+    
+    
+def _save_dit(transformer, accelerator=None, args=None, global_step=None, savedir=None):
+    if savedir is None:
+        save_directory = Path(args.output_dir) / f"saved-{global_step}"
+        save_directory.mkdir(parents=True, exist_ok=True)
+    else:
+        save_directory = savedir
+    
+    if accelerator is not None:
+        transformer = accelerator.unwrap_model(transformer)
+        
     config = deepcopy(transformer.config)
-    config["num_control_layers"] = len(block if block is not None transformer.control_blocks
-    json.dump(config)
+    config["num_control_layers"] = len([block for block in transformer.control_blocks if block is not None])
+    with open(save_directory / "configc.json", "w") as f:
+        json.dump(config, f, indent=4)
     transformer.save_config(save_directory)
     statedict = transformer.state_dict()
-    for k, v in statedict.items():
-        if not (k.startswith("control_blocks") or k.startswith("control_encoder") or k.startswith("zeroconvs")):
-            del statedict[k]
-    torch.save(statedict, save_directory / "controlnet_weights.pt")
+    retdict = {k: v for k, v in statedict.items() \
+        if k.startswith("control_blocks") or k.startswith("control_encoder") or k.startswith("zeroconvs")}
+    torch.save(retdict, save_directory / "controlnet_weights.pt")
     
     
-def load_dit(savedir, weight_dtype):
-    # TODO 
+def load_dit(savedir, weight_dtype=torch.float32):
     dir = Path(savedir)
-    config = json.load(dir / "config.json")
+    with open(dir / "configc.json", "r") as f:
+        config = json.load(f)
     modelname = config["_name_or_path"]
     
     # load pretrained transformer
@@ -886,12 +680,80 @@ def load_dit(savedir, weight_dtype):
     controlencoder = ControlSignalEncoder(21, 4).to(weight_dtype)
     controlencoder.zeroconv = create_zeroconv2d(4, 4, 1, padding=0)
     
-    adapted_transformer = adapt_transformer_controlnet(transformer, controlencoder, num_layers)
+    num_layers = config["num_control_layers"]
+    
+    adapted_transformer = adapt_transformer_controlnet(transformer, controlencoder, num_layers=num_layers)
+    
+    adapted_transformer.load_state_dict(torch.load(dir / "controlnet_weights.pt"), strict=False)
+    return adapted_transformer
+
+
+def compareModelWeights(model_a, model_b):
+    sd_a, sd_b = model_a.state_dict(), model_b.state_dict()
+    
+    if set(sd_a.keys()) != set(sd_b.keys()):
+        return False
+    
+    for k in sd_a.keys():
+        if not torch.all(sd_a[k] == sd_b[k].to(sd_a[k].device)):
+            return False
+        
+    return True
 
 
 class Validator:
     # TODO
-    pass
+    def __init__(self, transformer=None, vae=None, text_encoder=None, accelerator=None, examples=None):
+        self.init_pipeline(transformer=transformer, vae=vae, text_encoder=text_encoder, accelerator=accelerator)
+        self.init_data()
+        self.examples = examples
+    
+    def init_pipeline(self, transformer=None, vae=None, text_encoder=None, accelerator=None):
+        self.pipeline = PixArtSigmaControlNetPipeline.from_pretrained(ROOTNAME)
+        self.pipeline.vae = vae
+        self.pipeline.text_encoder = text_encoder
+        self.pipeline.transformer = accelerator.unwrap_model(transformer, keep_fp32_wrapper=False) if transformer is not None else None
+        self.acccelerator = accelerator
+        pipeline = pipeline.to(accelerator.device)
+        pipeline.set_progress_bar_config(disable=True)
+        torch.cuda.empty_cache()
+        
+    def init_data(self):        # get required number of examples
+        pass
+    
+    def generate(self, transformer=None, seed=None, device=None):
+        # logger.info(
+        #     f"Running validation... \n Generating {args.num_validation_images} images with prompt:"
+        #     f" {args.validation_prompt}."
+        # )
+        # create pipeline
+        # pipeline = DiffusionPipeline.from_pretrained(
+        #     ROOTNAME,
+        #     transformer=accelerator.unwrap_model(transformer, keep_fp32_wrapper=False),
+        #     text_encoder=text_encoder, vae=vae,
+        #     torch_dtype=weight_dtype,
+        # )
+        # pipeline = pipeline.to(accelerator.device)
+        # pipeline.set_progress_bar_config(disable=True)
+        
+        if transformer is not None:     # override transformer
+            self.pipeline.transformer = transformer
+            
+        self.pipeline.to(device)
+
+        # run inference
+        generator = torch.Generator(device=device)
+        if seed is not None:
+            generator = generator.manual_seed(seed)
+        images = []
+        for example in self.examples:
+            images.append(
+                self.pipeline(example["prompt"], control_image=example["control_image"].to(device), num_inference_steps=20, generator=generator, height=512, width=512).images[0])
+
+        self.pipeline.transformer = None
+        torch.cuda.empty_cache()
+        
+        return images
 
 
 
@@ -965,6 +827,14 @@ def main(args):
     )
 
     train_dl_iter = iter(train_dataloader)
+    
+    unwrapped_transformer = accelerator.unwrap_model(transformer, keep_fp32_wrapper=False)
+    validation_examples = []
+    while len(validation_examples) < args.num_validation_images:
+        i = random.randint(0, len(train_dataset))
+        validation_example = train_dataset[i]
+        validation_examples.append(validation_example)
+    validator = Validator(transformer=unwrapped_transformer, vae=vae, text_encoder=text_encoder, accelerator=accelerator, examples=validation_examples)
     
     for _ in range(global_step, args.num_train_steps):
         transformer.train()
@@ -1089,29 +959,10 @@ def main(args):
 
         if accelerator.is_main_process:
             if args.validation_prompt is not None and global_step % args.validate_every == 0:
-                logger.info(
-                    f"Running validation... \n Generating {args.num_validation_images} images with prompt:"
-                    f" {args.validation_prompt}."
-                )
-                # create pipeline
-                pipeline = DiffusionPipeline.from_pretrained(
-                    ROOTNAME,
-                    transformer=accelerator.unwrap_model(transformer, keep_fp32_wrapper=False),
-                    text_encoder=text_encoder, vae=vae,
-                    torch_dtype=weight_dtype,
-                )
-                pipeline = pipeline.to(accelerator.device)
-                pipeline.set_progress_bar_config(disable=True)
-
-                # run inference
-                generator = torch.Generator(device=accelerator.device)
-                if args.seed is not None:
-                    generator = generator.manual_seed(args.seed)
-                images = []
-                for _ in range(args.num_validation_images):
-                    images.append(
-                        pipeline(args.validation_prompt, num_inference_steps=20, generator=generator, height=512, width=512).images[0])
-
+                
+                unwrapped_transformer = accelerator.unwrap_model(transformer, keep_fp32_wrapper=False)
+                images = validator.generate(unwrapped_transformer, seed=args.seed, device=accelerator.device)
+                
                 for tracker in accelerator.trackers:
                     if tracker.name == "tensorboard":
                         np_images = np.stack([np.asarray(img) for img in images])
@@ -1126,22 +977,17 @@ def main(args):
                             }
                         )
 
-                del pipeline
-                torch.cuda.empty_cache()
-
     # Save the lora layers
     accelerator.wait_for_everyone()
     if accelerator.is_main_process:
         transformer = accelerator.unwrap_model(transformer, keep_fp32_wrapper=False)
-        transformer.save_pretrained(args.output_dir)
+        save_dit_path(transformer, savedir=args.output_dir / "dit-final")
         # lora_state_dict = get_peft_model_state_dict(transformer)
         # StableDiffusionPipeline.save_lora_weights(os.path.join(args.output_dir, "transformer_lora"), lora_state_dict)
 
     # Final inference
     # Load previous transformer
-    transformer = Transformer2DModel.from_pretrained(
-        args.pretrained_model_name_or_path, subfolder='transformer', torch_dtype=weight_dtype
-    )
+    transformer = load_dit(args.output_dir / "dit-final", torch_dtype=weight_dtype)
     # # load lora weight
     # transformer = PeftModel.from_pretrained(transformer, args.output_dir)
     # Load previous pipeline
@@ -1213,7 +1059,7 @@ def mainfire_pixelart(
         max_grad_norm=1.,
         num_train_steps=10000,
         checkpointing_steps=500,
-        save_every=500,
+        save_every=1,
         # mixed_precision="fp16",
         train_batch_size=2,
         gradient_accumulation_steps=4,
@@ -1241,9 +1087,9 @@ def mainfire_pixelart(
         main(args)
 
 
-# TODO: Implement custom pipeline (PixArtSigmaControlNetPipeline)
+# DONE: Implement custom pipeline (PixArtSigmaControlNetPipeline)
 # TODO: Implement validator that uses this pipeline
-# TODO: Implement saving and loading of model and checkpoints
+# DONE: Implement saving and loading of model and checkpoints
 
 
 if __name__ == "__main__":

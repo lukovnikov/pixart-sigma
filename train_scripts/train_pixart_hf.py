@@ -979,7 +979,7 @@ def mainfire_pixelart(
     ):
         fargs = locals().copy()
         dels = ["kwargs", "ModuleType", "_python_view_image_mod"]
-        for d in dels:
+        for d in dels: 
             if d in fargs:
                 del fargs[d]
         
