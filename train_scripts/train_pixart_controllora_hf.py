@@ -55,6 +55,8 @@ from diffusers.training_utils import compute_snr
 from diffusers.utils import check_min_version, is_wandb_available, make_image_grid
 from diffusers.utils.import_utils import is_xformers_available
 
+from peft import LoraConfig, get_peft_model_state_dict, get_peft_model, PeftModel
+
 import wandb
 
 from cocodata import COCOInstancesDataset, COCOPanopticDataset, masktensor_to_colorimage
@@ -64,6 +66,21 @@ from train_control_ae import ControlSignalEncoder, ControlSignalEncoderV2, Contr
 check_min_version("0.26.0.dev0")
 
 logger = get_logger(__name__, log_level="INFO")
+
+
+def print_trainable_parameters(model):
+    """
+    Prints the number of trainable parameters in the model.
+    """
+    trainable_params = 0
+    all_param = 0
+    for _, param in model.named_parameters():
+        all_param += param.numel()
+        if param.requires_grad:
+            trainable_params += param.numel()
+    print(
+        f"trainable params: {trainable_params} || all params: {all_param} || trainable%: {100 * trainable_params / all_param:.2f}"
+    )
 
 
 def save_model_card(repo_id: str, images=None, base_model=str, dataset_name=str, repo_folder=None):
@@ -100,10 +117,10 @@ def parse_args(inpargs):
     parser = argparse.ArgumentParser(description="Simple example of a training script.")
     
     parser.add_argument(
-        "--num_control_layers",
+        "--lora_rank",
         type=int,
-        default=-1,
-        help="Number of layers of the DiT to copy for ControlNet adaption. If -1, all layers are Control-adapted.",
+        default=16,
+        help="LoRA Rank",
     )
     
     parser.add_argument(
@@ -112,60 +129,22 @@ def parse_args(inpargs):
         default=None,
         help="Path to pretrained control encoder",
     )
-    parser.add_argument(
-        "--control_encoder2",
-        type=str,
-        default=None,
-        help="Path to second pretrained control encoder for simple adapter",
-    )
+    # parser.add_argument(
+    #     "--control_encoder2",
+    #     type=str,
+    #     default=None,
+    #     help="Path to second pretrained control encoder for simple adapter",
+    # )
     
-    parser.add_argument(
-        "--use_controlnet",
-        default=False,
-        action="store_true",
-        help=(
-            "Whether to center crop the input images to the resolution. If not set, the images will be randomly"
-            " cropped. The images will be resized to the resolution first before cropping."
-        ),
-    )
-    
-    
-    parser.add_argument(
-        "--use_identlin",
-        default=False,
-        action="store_true",
-        help=(
-            "Initialize controlnet's zero lin's to identity matrices instead"
-        ),
-    )
-    
-    
-    parser.add_argument(
-        "--use_lora",
-        default=False,
-        action="store_true",
-        help=(
-            "Use lora on base transformer model"
-        ),
-    )
-    parser.add_argument(
-        "--lora_rank",
-        type=int,
-        default=None,
-        help=(
-            "LoRA rank"
-        ),
-    )
-    
-    parser.add_argument(
-        "--use_adapters",
-        default=False,
-        action="store_true",
-        help=(
-            "Whether to center crop the input images to the resolution. If not set, the images will be randomly"
-            " cropped. The images will be resized to the resolution first before cropping."
-        ),
-    )
+    # parser.add_argument(
+    #     "--use_adapters",
+    #     default=False,
+    #     action="store_true",
+    #     help=(
+    #         "Whether to center crop the input images to the resolution. If not set, the images will be randomly"
+    #         " cropped. The images will be resized to the resolution first before cropping."
+    #     ),
+    # )
     
     parser.add_argument(
         "--pretrained_model_name_or_path", "--model",
@@ -476,8 +455,8 @@ def load_data(args, accelerator, tokenizer):
     # See Section 3.1. of the paper.
     max_length = args.max_token_length
     
-    # if accelerator.is_main_process:
-    dataset = COCOInstancesDataset(maindir=args.train_data_dir, split="train", upscale_to=512, max_masks=NUMOBJ)
+    if accelerator.is_main_process:
+        dataset = COCOInstancesDataset(maindir=args.train_data_dir, split="train", upscale_to=512, max_masks=NUMOBJ)
     
 
     caption_column = "captions"
@@ -502,8 +481,8 @@ def load_data(args, accelerator, tokenizer):
             tokenize_caption(example, proportion_empty_prompts=args.proportion_empty_prompts, max_length=max_length)
         return example
 
-    # with accelerator.is_main_process:
-    dataset.transforms.append(preprocess_train)
+    with accelerator.main_process_first():
+        dataset.transforms.append(preprocess_train)
 
     def collate_fn(examples):
         images = torch.stack([example["image"] for example in examples])
@@ -522,9 +501,6 @@ def load_data(args, accelerator, tokenizer):
         batch_size=args.train_batch_size,
         num_workers=args.dataloader_num_workers,
     )
-    
-    # batch = next(iter(train_dataloader))
-    # print(batch)
     
     return dataset, train_dataloader
 
@@ -546,12 +522,6 @@ def load_model(args, accelerator):
         controlencoder.load_state_dict(torch.load(Path(args.control_encoder)))
         controlencoder.zeroconv = create_zeroconv2d(4, 4, 1, padding=0)
         controlencoder.to(accelerator.device)
-    
-    controlencoder2 = None
-    if args.control_encoder2 is not None:
-        controlencoder2 = ControlSignalEncoderV3(21, 512, patchsize=2).to(weight_dtype)
-        controlencoder2.load_state_dict(torch.load(Path(args.control_encoder2)))
-        controlencoder2.to(accelerator.device)
 
     # Load scheduler, tokenizer and models.
     noise_scheduler = DDPMScheduler.from_pretrained(ROOTNAME, subfolder="scheduler", torch_dtype=weight_dtype)
@@ -564,17 +534,10 @@ def load_model(args, accelerator):
     vae.requires_grad_(False)
     vae.to(accelerator.device)
 
-    transformer = Transformer2DModel.from_pretrained(args.pretrained_model_name_or_path, subfolder="transformer", torch_dtype=weight_dtype)
-
-    # freeze parameters of models to save more memory
-    transformer.requires_grad_(False)
-    
-    # Freeze the transformer parameters before adding adapters
-    for param in transformer.parameters():
-        param.requires_grad_(False)
+    transformer = Transformer2DModel.from_pretrained(args.pretrained_model_name_or_path, subfolder="transformer", torch_dtype=weight_dtype)       
+    transformer.to(accelerator.device)
         
-        
-    return transformer, tokenizer, text_encoder, noise_scheduler, vae, weight_dtype, controlencoder, controlencoder2
+    return transformer, tokenizer, text_encoder, noise_scheduler, vae, weight_dtype, controlencoder
 
 
 def setup_accelerator(args, logging_dir):
@@ -585,7 +548,6 @@ def setup_accelerator(args, logging_dir):
         mixed_precision=args.mixed_precision,
         log_with=args.report_to,
         project_config=accelerator_project_config,
-        kwargs_handlers=[accelerate.DistributedDataParallelKwargs(find_unused_parameters=True)],
     )
 
     # Make one log on every process with the configuration for debugging.
@@ -651,14 +613,49 @@ def configure_optimizer(args, trainable_layers, transformer, accelerator):
     return optimizer
 
 
-def adapt_transformer_controlnet(transformer, control_encoder=None, control_encoder2=None, num_layers=-1, _return_trainable=False, use_controlnet=False, use_adapters=False, use_identlin=False, weight_dtype=torch.float32):
+def adapt_transformer_controllora(args, transformer, control_encoder=None, control_encoder2=None, num_layers=-1, _return_trainable=False):
     # convert vanilla Transformer model to one that also takes the control signal and has a controlnet branch
-    transformer = PixArtTransformer2DModelWithControlNet.adapt(transformer, control_encoder=control_encoder, control_encoder2=control_encoder2, num_layers=num_layers, use_controlnet=use_controlnet, use_adapters=use_adapters, use_identlin=use_identlin)
-    transformer.to(weight_dtype)
+    transformer = PixArtTransformer2DModelWithControlNet.adapt(transformer, control_encoder=control_encoder, control_encoder2=control_encoder2, num_layers=num_layers, use_controlnet=False, use_adapters=False)
+    
+    lora_config = LoraConfig(
+        r=args.lora_rank,
+        init_lora_weights="gaussian",
+        target_modules=[
+            "to_k",
+            "to_q",
+            "to_v",
+            "to_out.0",
+            "proj_in",
+            "proj_out",
+            "ff.net.0.proj",
+            "ff.net.2",
+            "proj",
+            "linear",
+            "linear_1",
+            "linear_2",
+        ],
+        use_dora=args.use_dora,
+        use_rslora=args.use_rslora,
+        modules_to_save=["control_encoder"],
+    )
+    
+    def cast_training_params(model: Union[torch.nn.Module, List[torch.nn.Module]], dtype=torch.float32):
+        if not isinstance(model, list):
+            model = [model]
+        for m in model:
+            for param in m.parameters():
+                # only upcast trainable parameters into fp32
+                if param.requires_grad:
+                    param.data = param.to(dtype)
+
+    transformer = get_peft_model(transformer, lora_config)
+    if args.mixed_precision == "fp16":
+        # only upcast trainable parameters (LoRA) into fp32
+        cast_training_params(transformer, dtype=torch.float32)
+
     if _return_trainable:
-        trainable = transformer.get_trainable_parameters()
-        # trainable = list(transformer.control_blocks.parameters()) 
-        # list(transformer.control_encoder.parameters()) + list(transformer.zeroconvs.parameters())        
+        transformer.print_trainable_parameters()
+        trainable = list(filter(lambda p: p.requires_grad, transformer.parameters()))
         return transformer, trainable
     else:
         return transformer
@@ -697,13 +694,6 @@ def save_checkpoint(args, accelerator, transformer, global_step):
     save_path = os.path.join(args.output_dir, f"checkpoint-{global_step}")
     accelerator.save_state(save_path)
 
-    # unwrapped_transformer = accelerator.unwrap_model(transformer, keep_fp32_wrapper=False)
-
-    # unwrapped_transformer.save_pretrained(
-    #     save_directory=save_path,
-    #     safe_serialization=True,
-    # )
-
     logger.info(f"Saved state to {save_path}")
     
     
@@ -726,18 +716,26 @@ def _save_dit(transformer, accelerator=None, args=None, global_step=None, savedi
     if accelerator is not None:
         transformer = accelerator.unwrap_model(transformer)
         
+    transformer_lora_state_dict = get_peft_model_state_dict(transformer)
+    
+    # LoraLoaderMixin.save_lora_weights(
+    #     save_directory=save_path,
+    #     unet_lora_layers=transformer_lora_state_dict,
+    #     safe_serialization=True,
+    # )
+        
     config = deepcopy(transformer.config)
-    config["num_control_layers"] = len([block for block in transformer.control_blocks if block is not None])
+    
     with open(save_directory / "configc.json", "w") as f:
         json.dump(config, f, indent=4)
     transformer.save_config(save_directory)
-    retdict = transformer.get_control_state_dict() if hasattr(transformer, "get_control_state_dict") else transformer.state_dict()
-    # retdict = {k: v for k, v in statedict.items() \
-    #     if k.startswith("control_blocks") or k.startswith("control_encoder") or k.startswith("zeroconvs")}
-    torch.save(retdict, save_directory / "controlnet_weights.pt")
+    transformer.peft_config["default"].save_pretrained(save_directory)
+    
+    torch.save(transformer_lora_state_dict, save_directory / "controllora_weights.pt")
     
     
-def load_dit(savedir, weight_dtype=torch.float32):      # TODO: this doesn't work for the simple connectors version
+def load_dit(savedir, weight_dtype=torch.float32):
+    # TODO
     dir = Path(savedir)
     with open(dir / "configc.json", "r") as f:
         config = json.load(f)
@@ -747,17 +745,12 @@ def load_dit(savedir, weight_dtype=torch.float32):      # TODO: this doesn't wor
     transformer = Transformer2DModel.from_pretrained(modelname, subfolder="transformer", torch_dtype=weight_dtype)
 
     # create control encoder
-    controlencoder = ControlSignalEncoder(21, 4).to(weight_dtype)
+    controlencoder = ControlSignalEncoderV3(21, 4).to(weight_dtype)
     controlencoder.zeroconv = create_zeroconv2d(4, 4, 1, padding=0)
     
-    num_layers = config["num_control_layers"]
-    use_controlnet = config["use_controlnet"] if "use_controlnet" in config else True   # previous verison compatibility
-    use_adapters = config["use_adapters"] if "use_adapters" in config else False
-    use_identlin = config["use_identlin"] if "use_identlin" in config else False
+    adapted_transformer = adapt_transformer_controllora(config, transformer, controlencoder)
     
-    adapted_transformer = adapt_transformer_controlnet(transformer, controlencoder, num_layers=num_layers, use_controlnet=use_controlnet, use_adapters=use_adapters, use_identlin=use_identlin)
-    
-    adapted_transformer.load_state_dict(torch.load(dir / "controlnet_weights.pt"), strict=False)
+    adapted_transformer.load_state_dict(torch.load(dir / "controllora_weights.pt"), strict=False)
     return adapted_transformer
 
 
@@ -776,9 +769,8 @@ def compareModelWeights(model_a, model_b):
 
 class Validator:
     
-    def __init__(self, transformer=None, vae=None, text_encoder=None, accelerator=None, examples=None, weight_dtype=torch.float32):
+    def __init__(self, transformer=None, vae=None, text_encoder=None, accelerator=None, examples=None):
         self.init_pipeline(transformer=transformer, vae=vae, text_encoder=text_encoder, accelerator=accelerator)
-        self.weight_dtype = weight_dtype
         self.init_data()
         self.examples = examples
     
@@ -826,7 +818,7 @@ class Validator:
         captions = []
         for example in self.examples:
             images.append(
-                self.pipeline(example["captions"][0], control_image=example["cond_image"][None].to(device, dtype=self.weight_dtype), num_inference_steps=20, generator=generator, height=512, width=512).images[0])
+                self.pipeline(example["captions"][0], control_image=example["cond_image"][None].to(device), num_inference_steps=20, generator=generator, height=512, width=512).images[0])
             cond_images.append(masktensor_to_colorimage(example["cond_image"]))
             captions.append(example["captions"][0])
 
@@ -862,14 +854,11 @@ class Validator:
 def main(args):
     validate_args(args)
     
-    with open(Path(args.output_dir) / "args.json", "w") as f:
-        json.dump(args.__dict__, f, indent=4)
-    
     logging_dir = Path(args.output_dir, args.logging_dir)
 
     accelerator = setup_accelerator(args, logging_dir)
-    transformer, tokenizer, text_encoder, noise_scheduler, vae, weight_dtype, control_encoder, control_encoder2 = load_model(args, accelerator)
-    transformer, trainable_layers = adapt_transformer_controlnet(transformer, control_encoder=control_encoder, control_encoder2=control_encoder2, num_layers=args.num_control_layers, _return_trainable=True, use_controlnet=args.use_controlnet, use_adapters=args.use_adapters, use_identlin=args.use_identlin, weight_dtype=weight_dtype)
+    transformer, tokenizer, text_encoder, noise_scheduler, vae, weight_dtype, control_encoder = load_model(args, accelerator)
+    transformer, trainable_layers = adapt_transformer_controllora(args, transformer, control_encoder=control_encoder, _return_trainable=True)
     optimizer = configure_optimizer(args, trainable_layers, transformer, accelerator)
     train_dataset, train_dataloader = load_data(args, accelerator, tokenizer)
     lr_scheduler = configure_lr_scheduler(args, train_dataloader, optimizer, accelerator)
@@ -882,10 +871,7 @@ def main(args):
     # We need to initialize the trackers we use, and also store our configuration.
     # The trackers initializes automatically on the main process.
     if accelerator.is_main_process:
-        accelerator.init_trackers("pixart-controlnet-coco-v2", config=vars(args))
-
-    print("use identlin: ", args.use_identlin)
-
+        accelerator.init_trackers("pixart-controllora-coco-v2", config=vars(args))
 
     # TRAIN LOOP !
     total_batch_size = args.train_batch_size * accelerator.num_processes * args.gradient_accumulation_steps
@@ -940,15 +926,11 @@ def main(args):
         validation_example = train_dataset[i]
         validation_examples.append(validation_example)
         
-    unwrapped_transformer = accelerator.unwrap_model(transformer, keep_fp32_wrapper=False)
-    validator = Validator(transformer=unwrapped_transformer, vae=vae, text_encoder=text_encoder, accelerator=accelerator, examples=validation_examples, weight_dtype=weight_dtype)
+    # unwrapped_transformer = accelerator.unwrap_model(transformer, keep_fp32_wrapper=False)
+    validator = Validator(transformer=transformer, vae=vae, text_encoder=text_encoder, accelerator=accelerator, examples=validation_examples)
     
     last_val_global_step = -1
-    
-    if False:
-        save_dit_path(unwrapped_transformer, Path(args.output_dir) / "testsave")
-        reloaded = load_dit(Path(args.output_dir) / "testsave")
-    
+            
     # for i in range(global_step, args.num_train_steps):
     while True:
         transformer.train()
@@ -967,7 +949,7 @@ def main(args):
             latents = vae.encode(batch["image"].to(dtype=weight_dtype)).latent_dist.sample()
             latents = latents * vae.config.scaling_factor
             
-            control_image = batch["cond_image"].to(dtype=weight_dtype)
+            control_image = batch["cond_image"]
 
             # Sample noise that we'll add to the latents
             noise = torch.randn_like(latents)
@@ -1153,17 +1135,12 @@ def mainfire(
         
 def mainfire_pixelart(
         train_data_dir="/USERSPACE/lukovdg1/coco2017",
-        # use_identlin=True,
-        output_dir="/USERSPACE/lukovdg1/pixart-sigma/train_scripts/control_experiments_v2/pixart_coco_simpleadapters",
+        output_dir="/USERSPACE/lukovdg1/pixart-sigma/train_scripts/control_experiments_v2/pixart_coco_controllora",
         # resume_from_checkpoint="latest",
         pretrained_model_name_or_path="PixArt-alpha/PixArt-Sigma-XL-2-512-MS",
-        # use_controlnet=True,
-        # control_encoder="/USERSPACE/lukovdg1/pixart-sigma/train_scripts/control_ae_output_v2_controlnet/encoder.pth",
-        # num_control_layers=14,
-        use_adapters=True,
-        control_encoder2="/USERSPACE/lukovdg1/pixart-sigma/train_scripts/control_ae_output_v2_simpleadapter/encoder.pth",
+        control_encoder="/USERSPACE/lukovdg1/pixart-sigma/train_scripts/control_ae_output_v2_controlnet/encoder.pth",
         validate_every=200,
-        learning_rate=1e-5,
+        learning_rate=5e-5,
         max_grad_norm=1.,
         num_train_steps=50000,
         checkpointing_steps=1000,
@@ -1213,16 +1190,6 @@ def mainfire_pixelart(
 # DONE: check why COCO Instances has more than one polygon per mask sometimes: --> for second part of object
 # DONE: write dataloading for COCO Instances that doesn't transform them to RGB and back
 # DONE: debug and start training with COCO Instances
-
-# TODO: train simple adapters with 4 GPUs and total batch size 32 for 50k steps
-# TODO: train controlnet with 4 GPU's and total batch size 32 for 50k steps
-# TODO: properly train control-lora with batch size 32 and 50k steps
-# TODO: try HED controlnet to see how fast it trains 
-# TODO: implement attention learning
-#    [ ]: use F30k entities or caption all COCO objects using LLAVA
-#    [ ]: modify model to classify how to mix different masked version of attention (region-matching, other regions, other)
-#    [ ]: train
-# TODO: try simple adapters + lora
 
 
 if __name__ == "__main__":

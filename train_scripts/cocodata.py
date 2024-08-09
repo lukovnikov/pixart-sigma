@@ -1,6 +1,6 @@
 from copy import copy
 import math
-from PIL import Image
+from PIL import Image, ImageDraw
 import json
 from pathlib import Path
 from torch.utils.data import Dataset, IterableDataset, DataLoader
@@ -91,6 +91,14 @@ def colorgen_hsv(numhues=36):
                 continue
             
             
+def masktensor_to_colorimage(x):
+    """ Takes a mask tensor (C x H x W) where C can be > 3 and returns an RGB image tensor (3 x H x W) with random colors assigned to different masks"""
+    randomcolors = torch.tensor([randomcolor_hsv() for _ in range(x.size(0))])     # (C x 3)
+    indexes = x.max(0)[1]
+    colorimg = randomcolors[indexes].permute(2, 0, 1)
+    return colorimg
+            
+            
 def randomcolor_hsv():
     hue = random.uniform(0, 360)
     sat = random.uniform(0.4, 0.9)
@@ -142,18 +150,19 @@ class COCOPanopticExample(object):
             img = Image.open(self.seg_path).convert("RGB")
         else:
             img = self.seg_data
-        return img
+        return img        
         
         
 class COCOPanopticDataset(Dataset):
     padlimit=1 #5
-    min_region_area = -1 # 0.002
+    min_region_area = 16*16 #-1 # 0.002
     
     def __init__(self, maindir:str=None, split="valid", max_masks=20, min_masks=2, max_samples=None, min_size=350, upscale_to=None,
                  examples=None, mergeregions=False,  # mergeregions?
                  regiondrop=False,           # if False, dropping examples with too many masks, if True: keeping all examples and dropping randomly some masks, if float: acts like True, but also drops some masks with the given number as drop probability
                  casmode=None, simpleencode=False, limitpadding=False,
                  tokenizer="openai/clip-vit-large-patch14",
+                 useinstances=False,
                  usescribbles=False, usecanny=False):
         super().__init__()
         assert examples is None or maindir is None      # provide either a directory or a list of already made examples
@@ -162,6 +171,7 @@ class COCOPanopticDataset(Dataset):
         self.load_tokenizer(tokenizer)
         
         self.casmode = casmode
+        self.useinstances = useinstances
         
         self.usescribbles = usescribbles
         self.usecanny = usecanny
@@ -193,13 +203,22 @@ class COCOPanopticDataset(Dataset):
                 
             self.img_dir = Path(self.maindir) / f"{which}2017"
             captionsfile = Path(self.maindir) / "annotations" / f"captions_{which}2017.json"
-            panopticsfile = Path(self.maindir) / "annotations" / f"panoptic_{which}2017.json"
-            self.panoptic_dir = Path(self.maindir) / "annotations" / f"panoptic_{which}2017"
+            
+            if self.useinstances:
+                instancesfile = Path(self.maindir) / "annotations" / f"inst_{which}2017.json"
+                self.panoptic_dir = Path(self.maindir) / "annotations" / f"instances_{which}2017"
+            else:
+                panopticsfile = Path(self.maindir) / "annotations" / f"panoptic_{which}2017.json"
+                self.panoptic_dir = Path(self.maindir) / "annotations" / f"panoptic_{which}2017"
             
             print("loading captions")     
             image_db, captiondb = self.load_captions(captionsfile, img_dir=self.img_dir)        # creates image db and caption db
             print("loading panoptics")
-            _, panoptic_db = self.load_panoptics(panopticsfile, panoptic_dir=self.panoptic_dir)      # creates category db and panoptic db
+            
+            if self.useinstances:
+                _, panoptic_db = self.load_instances(instancesfile, panoptic_dir=self.panoptic_dir)      # creates category db and panoptic db
+            else:
+                _, panoptic_db = self.load_panoptics(panopticsfile, panoptic_dir=self.panoptic_dir)      # creates category db and panoptic db
             
             example_ids = list(image_db.keys())
             
@@ -352,6 +371,35 @@ class COCOPanopticDataset(Dataset):
             panoptic_db[annotation["image_id"]] = saveann
             
         return panoptic_category_db, panoptic_db
+    
+    def load_instances(self, panopticpath, panoptic_dir=Path("")):
+        # load category db
+        panoptic_category_db = {}
+        panopticsinfo = json.load(open(panopticpath))
+        def process_category_name(name):
+            if name.endswith("-merged"):
+                name = name[:-len("-merged")]
+            if name.endswith("-other"):
+                name = name[:-len("-other")]
+            if name.endswith("-stuff"):
+                name = name[:-len("-stuff")]
+            name = name.replace("-", " ")
+            return name
+        for category in panopticsinfo["categories"]:
+            panoptic_category_db[category["id"]] = process_category_name(category["name"])
+            
+        # load panoptics annotations
+        panoptic_db = {}
+        for imgid, img in panopticsinfo["imgd"].items():
+            assert img["id"] not in panoptic_db
+            saveann = {"segments_map": panoptic_dir / (str(Path(img["path"]).stem) + ".png"), "segments_info": {}}
+            for segment in img["masks"]:
+                assert segment["colorid"] not in saveann["segments_info"]
+                saveann["segments_info"][segment["colorid"]] = {"category_id": segment["category_id"],
+                                                           "caption": panoptic_category_db[segment["category_id"]]}
+            panoptic_db[img["id"]] = saveann
+            
+        return panoptic_category_db, panoptic_db
                 
     def load_tokenizer(self, tokenizer):
         if isinstance(tokenizer, str):
@@ -489,6 +537,8 @@ class COCOPanopticDataset(Dataset):
             upscalefactor = self.upscale_to / min(img.size)
             newsize = [math.ceil(s * upscalefactor) for s in img.size]
             img = img.resize(newsize, resample=Image.BILINEAR)
+            upscalefactor = self.upscale_to / min(seg_img.size)
+            newsize = [math.ceil(s * upscalefactor) for s in seg_img.size]
             seg_img = seg_img.resize(newsize, resample=Image.BOX)
             
         # 2. transform to tensors
@@ -503,17 +553,20 @@ class COCOPanopticDataset(Dataset):
         captions = [random.choice(example.captions)]
     
         # 4. load masks
-        ids = list(range(1, self.max_masks+1))
+        ids = list(range(0, self.max_masks+1))
         random.shuffle(ids)
         
         for i, (region_code, region_info) in enumerate(example.seg_info.items()):
             rgb = torch.tensor(region_code_to_rgb(region_code))
             region_mask = (seg_imgtensor == rgb[:, None, None]).all(0)
-            if (region_mask > 0).sum() / np.prod(region_mask.shape) < self.min_region_area:
+            maskid = ids.pop(0)
+            if (region_mask > 0).sum()  < self.min_region_area:
                 continue
-            cond_imgtensor[ids[i]] = region_mask
+            cond_imgtensor[maskid] = region_mask
             
-        cond_imgtensor[0] = cond_imgtensor[1:].long().sum(0) == 0
+        maskid = ids.pop(0)
+        bgrmask = cond_imgtensor.long().sum(0) == 0
+        # cond_imgtensor[maskid] = bgrmask
 
         # random square crop of size divisble by 64 and maximum size 512
         cropsize = min((min(imgtensor[0].shape) // 64) * 64, 512)
@@ -542,15 +595,341 @@ class COCOPanopticDataset(Dataset):
         return ret
     
     
+class COCOInstancesExample(object):
+    def __init__(self, id=None, img=None, captions=None, seg_info=None, imgsize=None, usecache=False) -> None:
+        super().__init__()
+        self.id = id
+        self.image_path, self.image_data = None, None
+        if isinstance(img, (str, Path)):
+            self.image_path = img
+        else:
+            assert isinstance(img, (Image.Image,))
+            self.image_data = img
+        assert self.image_data is None or self.image_path is None       # provide either path or data
+        
+        self.captions = captions
+        self.seg_info = seg_info
+        self.imgsize = imgsize
+        
+        self.usecache = usecache
+        self._img_cache = None
+        self._seg_masks_cache = None
+        
+    def load_image(self, upscale_to=None):
+        if self._img_cache is None:
+            if self.image_path is not None:
+                img = Image.open(self.image_path).convert("RGB")
+            else:
+                img = self.image_data
+            if upscale_to is not None:
+                upscalefactor = upscale_to / min(img.size)
+                newsize = [math.ceil(s * upscalefactor) for s in img.size]
+                img = img.resize(newsize, resample=Image.BILINEAR)
+            if self.usecache:
+                self._img_cache = img
+        else:
+            img = self._img_cache
+        return img
+    
+    def load_seg_image(self, upscale_to=None):
+        if self._seg_masks_cache is None:
+            upscalefactor = upscale_to / min(self.imgsize) if upscale_to is not None else 1.
+            newimgsize = [math.ceil(x * upscalefactor) for x in self.imgsize]
+            
+            masktensors = []
+            
+            for maskid, mask in enumerate(self.seg_info):
+                maskimg = Image.new('L', newimgsize, 'black')
+                maskimgdraw = ImageDraw.Draw(maskimg)
+                for polygon in mask["segmentation"]:
+                    coords = []
+                    i = 0
+                    while i < len(polygon):
+                        coords.append((float(polygon[i]) * upscalefactor, float(polygon[i + 1]) * upscalefactor))
+                        i += 2
+                    maskimgdraw.polygon(coords, fill="white", outline="white")
+                masktensors.append(to_tensor(maskimg).to(torch.bool)[0])
+            
+            ret = torch.stack(masktensors, 0) if len(masktensors) > 0 else torch.zeros(newimgsize, dtype=torch.bool)[None]
+            if self.usecache:
+                self._seg_masks_cache = ret 
+        else:
+            ret = self._seg_masks_cache
+        return ret
+    
+
+class COCOInstancesDataset(Dataset):
+    padlimit=1 #5
+    min_region_area = 16*16 #-1 # 0.002
+    
+    def __init__(self, maindir:str=None, split="valid", max_masks=20, min_masks=2, max_samples=None, min_size=350, upscale_to=None):
+        super().__init__()
+        self.maindir = maindir
+        self.n = 0
+        
+        self.max_masks = max_masks
+        self.min_masks = min_masks
+        self.min_size = min_size
+        self.upscale_to = upscale_to
+            
+        sizestats = {}
+        examplespersize = {}
+        numtoofewregions = 0
+        numtoomanyregions = 0
+        numtoosmall = 0
+        
+        numexamples = 0
+        
+            
+        if split.startswith("v"):
+            which = "val"
+        elif split.startswith("tr"):
+            which = "train"
+            
+        self.img_dir = Path(self.maindir) / f"{which}2017"
+        captionsfile = Path(self.maindir) / "annotations" / f"captions_{which}2017.json"
+        instancesfile = Path(self.maindir) / "annotations" / f"instances_{which}2017.json"
+        
+        print("loading captions")     
+        image_db, caption_db = self.load_captions(captionsfile, img_dir=self.img_dir)        # creates image db and caption db
+        
+        print("loading instances")
+        instance_db = self.load_instances(instancesfile)      # creates category db and panoptic db
+        
+        example_ids = list(image_db.keys())
+        
+        # filter examples
+        print("Creating examples")
+        for example_id in tqdm.tqdm(example_ids):
+            # captions = [self.tokenize([caption]) for caption in captions]
+            frame_size = (image_db[example_id]["width"], image_db[example_id]["height"])
+            cropsize = min((min(frame_size) // 64) * 64, 512)
+            if cropsize < self.min_size:
+                numtoosmall += 1
+                continue
+            
+            if cropsize not in sizestats:
+                sizestats[cropsize] = 0
+            sizestats[cropsize] += 1
+                
+            numregions = len(instance_db[example_id]["masks"])
+                
+            if numregions > max_masks:
+                numtoomanyregions += 1
+                continue
+            if numregions < min_masks:
+                numtoofewregions += 1
+                continue
+            
+            if cropsize not in examplespersize:
+                examplespersize[cropsize] = []
+                
+            example = COCOInstancesExample(id=example_id, 
+                                            img=image_db[example_id]["path"],
+                                            seg_info=instance_db[example_id]["masks"],
+                                            captions=caption_db[example_id],
+                                            imgsize=instance_db[example_id]["size"],
+                                            )
+            examplespersize[cropsize].append(example)
+            
+            numexamples += 1
+            if max_samples is not None and numexamples >= max_samples:
+                break
+                
+        
+        self.examples = [ve for k, v in examplespersize.items() for ve in v]        
+            
+        print("Size stats:")
+        print(sizestats)
+        print(f"Retained examples: {len(self)}")
+        print(f"Too many regions: {numtoomanyregions}")
+        print(f"Too few regions: {numtoofewregions}")
+        print(f"Too small: {numtoosmall}")
+        
+        self.transforms = []
+        
+    def filter_ids(self, ids):
+        newselfexamples = []
+        for res, examples in self.examples:
+            newexamples = []
+            for example in examples:
+                if example.id in ids:
+                    newexamples.append(example)
+            if len(newexamples) > 0:
+                newselfexamples.append((res, newexamples))
+        self.examples = newselfexamples
+        
+    def load_captions(self, captionpath, img_dir=Path("")):
+        captions = json.load(open(captionpath))
+        # load image db
+        image_db = {}
+        for imageinfo in captions["images"]:
+            image_db[imageinfo["id"]] = {
+                "path": img_dir / imageinfo["file_name"],
+                "height": imageinfo["height"],
+                "width": imageinfo["width"]
+            }
+        # load caption db
+        captiondb = {}   # from image_id to list of captions
+        for annotation in captions["annotations"]:
+            imgid = annotation["image_id"]
+            if imgid not in captiondb:
+                captiondb[imgid] = []
+            captiondb[imgid].append(annotation["caption"])
+            
+        return image_db, captiondb
+            
+    def load_instances(self, instancesfile):
+        # load category db
+        category_db = {}
+        instancesinfo = json.load(open(instancesfile))
+        
+        for category in instancesinfo["categories"]:
+            category_db[category["id"]] = category["name"]
+            
+        # load panoptics annotations
+        imgd = {}
+        
+        for image in instancesinfo["images"]:
+            imgd[image["id"]] = {"path": image["file_name"], "size": (image["width"], image["height"]), "id": image["id"], "masks": []}
+            
+        for mask in instancesinfo["annotations"]:
+            if "counts" in mask["segmentation"]:
+                continue
+            if mask["area"] < self.min_region_area: 
+                continue
+            imgd[mask["image_id"]]["masks"].append(mask)
+            
+        # load panoptics annotations
+        for imgid, img in imgd.items():
+            for mask in img["masks"]:
+                mask["category_name"] = category_db[mask["category_id"]]
+            
+        return imgd
+
+    def __getstate__(self):
+        ret = copy(self.__dict__)
+        del ret["tokenizer"]
+        return ret
+    
+    def __setstate__(self, state):
+        for k, v in state.items():
+            setattr(self, k, v)
+        self.load_tokenizer()
+ 
+    def __getitem__(self, item):
+        example = self.examples[item]
+    
+        ret = self.materialize_example(example)
+        return ret
+    
+    def __len__(self):
+        return len(self.examples)
+        #sum([len(v) for k, v in self.examples])
+            
+    def materialize_example(self, example):   
+        # materialize one example
+        # 1. load image and segmentation map
+        img = example.load_image(upscale_to=self.upscale_to)   #Image.open(self.image_db[example_id]["path"]).convert("RGB")
+        seg_imgtensor = example.load_seg_image(upscale_to=self.upscale_to)   #Image.open(self.panoptic_db[example_id]["segments_map"]).convert("RGB")
+            
+        # 2. transform to tensors
+        imgtensor = to_tensor(img)
+        
+        # 3. create conditioning image by randomly swapping out colors
+        # cond_imgtensor = torch.ones_like(imgtensor) * torch.tensor(randomcolor_hsv())[:, None, None]
+        cond_imgtensor = torch.zeros(self.max_masks + 1, imgtensor.size(1), imgtensor.size(2), dtype=torch.long, device=imgtensor.device)
+        
+        # 4. pick one caption at random (TODO: or generate one from regions)
+        captions = [random.choice(example.captions)]
+    
+        # 4. load masks
+        ids = list(range(0, self.max_masks+1))
+        random.shuffle(ids)
+        
+        for i, (mask) in enumerate(seg_imgtensor.unbind(0)):
+            maskid = ids.pop(0)
+            cond_imgtensor[maskid] = mask
+            
+        if False:
+            maskid = ids.pop(0)
+            bgrmask = cond_imgtensor.long().sum(0) == 0
+            cond_imgtensor[maskid] = bgrmask
+
+        # random square crop of size divisble by 64 and maximum size 512
+        cropsize = min((min(imgtensor[0].shape) // 64) * 64, 512)
+        crop = (random.randint(0, imgtensor.shape[1] - cropsize), 
+                random.randint(0, imgtensor.shape[2] - cropsize))
+        # print(cropsize)
+        
+        imgtensor = imgtensor[:, crop[0]:crop[0]+cropsize, crop[1]:crop[1]+cropsize]
+        cond_imgtensor = cond_imgtensor[:, crop[0]:crop[0]+cropsize, crop[1]:crop[1]+cropsize]
+            
+        imgtensor = imgtensor * 2 - 1.
+        
+        ret = { "image": imgtensor, 
+                "cond_image": cond_imgtensor,
+                "captions": captions,
+                "image_path": example.image_path
+                }
+        
+        for transform in self.transforms:
+            ret = transform(ret)
+            
+        return ret
+    
+    
 
 # !!! IDEA: only use the higher-res images for training later denoising steps
     
+def collate_fn(listofdicts):
+    ret = {}
+    for k in listofdicts[0]:
+        ret[k] = []
+        
+    for d in listofdicts:
+        assert set(d.keys()) == set(ret.keys())
+        for k, v in d.items():
+            ret[k].append(v)
+    
+    for k in ret:
+        if isinstance(ret[k][0], torch.Tensor):
+            ret[k] = torch.stack(ret[k], 0)
+            
+    return ret
+
     
 def main(x=0):
     import pickle
-    cocodataset = COCOPanopticDataset(maindir="/USERSPACE/lukovdg1/coco2017", split="train", upscale_to=512)
+    cocodataset = COCOInstancesDataset(maindir="/USERSPACE/lukovdg1/coco2017", split="tr", upscale_to=512)
+    
+    # example = cocodataset[0]
+    
+    # for i in tqdm.tqdm(range(len(cocodataset))):
+    #     example = cocodataset[i]
+        
+    # print("iterated over all examples in dataset")
+    
+    
     print(len(cocodataset))
-    dl = DataLoader(cocodataset, batch_size=4)
+    dl = DataLoader(cocodataset, batch_size=4, collate_fn=collate_fn, num_workers=10)
+    
+    
+    for batch in tqdm.tqdm(dl):
+        pass
+        
+    print("iterated over all examples in dataloader")
+    
+    
+    print(len(cocodataset))
+    dl = DataLoader(cocodataset, batch_size=4, collate_fn=collate_fn, num_workers=10)
+    
+    
+    for batch in tqdm.tqdm(dl):
+        pass
+        
+    print("iterated again over all examples in dataloader")
+        
     
     batch = next(iter(dl))
     # print(batch)

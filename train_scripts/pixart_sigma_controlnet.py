@@ -15,7 +15,7 @@
 from copy import deepcopy
 import html
 import inspect
-import re
+import re, os
 import urllib.parse as ul
 from typing import Any, Callable, Dict, List, Optional, Tuple, Union
 
@@ -120,32 +120,100 @@ def create_zeroconv2d(inpch, outch, kernel, padding=0):
     return conv
 
 
-def create_zerolin(inpch, outch, padding=0):
+def create_zerolin(inpch, outch):
     conv = torch.nn.Linear(inpch, outch)
     zero_module(conv)
     return conv
 
 
+def create_identlin(inpch, outch):
+    conv = torch.nn.Linear(inpch, outch)
+    conv.weight.data = torch.diagflat(torch.ones_like(torch.diagonal(conv.weight.data))) * 0.5
+    conv.bias.data = torch.zeros_like(conv.bias.data)
+    return conv
+
+
+class FeatureGate(torch.nn.Module):
+    init_main_frac = 0.9
+    
+    def __init__(self, numfeats):
+        self.numfeats = numfeats
+        self.gate_main = torch.nn.Parameter(torch.ones(self.numfeats) * self.init_main_frac)
+        self.gate_branch = torch.nn.Parameter(torch.ones(self.numfeats) * (1 - self.init_main_frac))
+        
+    def forward(self, main, branch):
+        gated_main = main * self.gate_main[None, None]
+        gated_branch = branch * self.gate_branch[None, None]
+        return gated_main + gated_branch
+
+
 class PixArtTransformer2DModelWithControlNet(PixArtTransformer2DModel):
-    def initialize_adapter(self, control_blocks, control_encoder):
+    def initialize_adapter(self, control_blocks, control_encoder, use_identlin=False):
         self.control_blocks = torch.nn.ModuleList(control_blocks)
         self.control_encoder = control_encoder
         
-        self.zeroconvs = torch.nn.ModuleList([
-            create_zerolin(block.ff.net[2].out_features, block.ff.net[2].out_features) if block is not None else None \
-                for block in self.control_blocks
-        ])
+        self.zeroconvs = torch.nn.ModuleList([None for _ in self.control_blocks])
+        
+        self.use_identlin = use_identlin
+        
+        if not self.use_identlin:
+            self.zeroconvs = torch.nn.ModuleList([
+                create_zerolin(block.ff.net[2].out_features, block.ff.net[2].out_features) if block is not None else None \
+                    for block in self.control_blocks
+            ])
+        else:
+            # self.zeroconvs = torch.nn.ModuleList([
+            #     create_identlin(block.ff.net[2].out_features, block.ff.net[2].out_features) if block is not None else None \
+            #         for block in self.control_blocks
+            # ])
+            self.zeroconvs = torch.nn.ModuleList([
+                FeatureGate(block.ff.net[2].out_features) if block is not None else None for block in self.control_blocks
+            ])
+        
+    def initialize_simple_adapter(self, connectors, control_encoder2):
+        self.simple_connectors = torch.nn.ModuleList(connectors)
+        self.simple_encoder = control_encoder2
     
     @classmethod
-    def adapt(cls, main, control_encoder, num_layers=-1):
+    def adapt(cls, main, control_encoder=None, control_encoder2=None, num_layers=-1, use_controlnet=False, use_adapters=False, use_identlin=False):
         control_blocks = [None] * len(main.transformer_blocks)
-        for i in range(len(main.transformer_blocks)):
-            if num_layers == -1 or i < num_layers:
-                control_blocks[i] = deepcopy(main.transformer_blocks[i])
+        if use_controlnet:
+            for i in range(len(main.transformer_blocks)):
+                if num_layers == -1 or i < num_layers:
+                    control_blocks[i] = deepcopy(main.transformer_blocks[i])
         
         main.__class__ = cls
-        main.initialize_adapter(control_blocks, control_encoder)
+        main.initialize_adapter(control_blocks, control_encoder, use_identlin=use_identlin)
+        
+        connectors = [None] * len(main.transformer_blocks)
+        if use_adapters:
+            tm_dim = main.transformer_blocks[0].ff.net[2].out_features
+            for i in range(len(main.transformer_blocks)):
+                connectors[i] = torch.nn.Sequential(
+                    torch.nn.Linear(control_encoder2.outchannels, tm_dim),
+                    torch.nn.SiLU(),
+                    torch.nn.Linear(tm_dim, tm_dim),
+                )
+                
+        main.initialize_simple_adapter(connectors, control_encoder2)
+        
         return main
+    
+    def get_trainable_parameters(self):
+        ret = []
+        if self.control_encoder is not None:
+            ret += list(self.control_encoder.parameters()) + list(self.control_blocks.parameters()) + list(self.zeroconvs.parameters())
+        if self.simple_encoder is not None:
+            ret += list(self.simple_encoder.parameters()) + list(self.simple_connectors.parameters())
+        
+        return ret
+    
+    def get_control_state_dict(self):
+        ret = {}
+        for k, v in self.state_dict().items():
+            if k.split(".")[0] in {"control_encoder", "control_blocks", "zeroconvs", "simple_encoder", "simple_connectors"}:
+                ret[k] = v
+        return ret
         
     def forward(
         self,
@@ -199,7 +267,11 @@ class PixArtTransformer2DModelWithControlNet(PixArtTransformer2DModel):
         # Encode control image and add to hidden states
         if self.control_encoder is not None:
             control_latents = self.control_encoder(control_image)[0]       # control encoder should already have zeroconv on it
-        hidden_states_control = hidden_states + control_latents
+            hidden_states_control = hidden_states + control_latents
+            
+        if self.simple_encoder is not None:
+            simple_latents = self.simple_encoder(control_image)[0]
+            simple_latents = simple_latents.flatten(2).transpose(1, 2)  # BCHW -> BNC
         
         if self.use_additional_conditions and added_cond_kwargs is None:
             raise ValueError("`added_cond_kwargs` cannot be None when using additional conditions for `adaln_single`.")
@@ -234,7 +306,9 @@ class PixArtTransformer2DModelWithControlNet(PixArtTransformer2DModel):
             hidden_states.shape[-1] // self.config.patch_size,
         )
         hidden_states = self.pos_embed(hidden_states)       # patching happens here
-        hidden_states_control = self.pos_embed(hidden_states_control)
+        if self.control_encoder is not None:
+            hidden_states_control = self.pos_embed(hidden_states_control)
+        prev_hidden_state_control = None
 
         timestep, embedded_timestep = self.adaln_single(
             timestep, added_cond_kwargs, batch_size=batch_size, hidden_dtype=hidden_states.dtype
@@ -245,7 +319,14 @@ class PixArtTransformer2DModelWithControlNet(PixArtTransformer2DModel):
             encoder_hidden_states = encoder_hidden_states.view(batch_size, -1, hidden_states.shape[-1])
 
         # 2. Blocks
-        for block, control_block, zeroconv in zip(self.transformer_blocks, self.control_blocks, self.zeroconvs):
+        for block, control_block, zeroconv, simple_connector in zip(self.transformer_blocks, self.control_blocks, self.zeroconvs, self.simple_connectors):
+            hidden_states_in = hidden_states
+            if simple_connector is not None:
+                hidden_states_in += simple_connector(simple_latents)
+                
+            # if prev_hidden_state_control is not None:
+            #     hidden_states_in += prev_hidden_state_control
+                    
             if self.training and self.gradient_checkpointing:
 
                 def create_custom_forward(module, return_dict=None):
@@ -258,9 +339,11 @@ class PixArtTransformer2DModelWithControlNet(PixArtTransformer2DModel):
                     return custom_forward
 
                 ckpt_kwargs: Dict[str, Any] = {"use_reentrant": False} if is_torch_version(">=", "1.11.0") else {}
+                
+                
                 hidden_states = torch.utils.checkpoint.checkpoint(
                     create_custom_forward(block),
-                    hidden_states,
+                    hidden_states_in,
                     attention_mask,
                     encoder_hidden_states,
                     encoder_attention_mask,
@@ -281,11 +364,14 @@ class PixArtTransformer2DModelWithControlNet(PixArtTransformer2DModel):
                         None,
                         **ckpt_kwargs,
                     )
-                # if zeroconv is not None:
-                    hidden_states = hidden_states + zeroconv(hidden_states_control)
+                    if self.use_identlin:
+                        prev_hidden_state_control = zeroconv(hidden_states, hidden_states_control)
+                    else:
+                        prev_hidden_state_control = zeroconv(hidden_states_control)
+                    hidden_states += prev_hidden_state_control
             else:
                 hidden_states = block(
-                    hidden_states,
+                    hidden_states_in,
                     attention_mask=attention_mask,
                     encoder_hidden_states=encoder_hidden_states,
                     encoder_attention_mask=encoder_attention_mask,
@@ -303,8 +389,11 @@ class PixArtTransformer2DModelWithControlNet(PixArtTransformer2DModel):
                         cross_attention_kwargs=cross_attention_kwargs,
                         class_labels=None,
                     )
-                # if zeroconv is not None:
-                    hidden_states = hidden_states + zeroconv(hidden_states_control)
+                    if self.use_identlin:
+                        prev_hidden_state_control = zeroconv(hidden_states, hidden_states_control)
+                    else:
+                        prev_hidden_state_control = zeroconv(hidden_states_control)
+                    hidden_states += prev_hidden_state_control
 
         # 3. Output
         shift, scale = (
@@ -551,6 +640,7 @@ class PixArtSigmaControlNetPipeline(PixArtSigmaPipeline):
         with self.progress_bar(total=num_inference_steps) as progress_bar:
             for i, t in enumerate(timesteps):
                 latent_model_input = torch.cat([latents] * 2) if do_classifier_free_guidance else latents
+                control_image_input = torch.cat([control_image] * 2) if do_classifier_free_guidance else control_image
                 latent_model_input = self.scheduler.scale_model_input(latent_model_input, t)
 
                 current_timestep = t
@@ -571,7 +661,7 @@ class PixArtSigmaControlNetPipeline(PixArtSigmaPipeline):
                 # predict noise model_output
                 noise_pred = self.transformer(
                     latent_model_input,
-                    control_image=control_image,
+                    control_image=control_image_input.to(dtype=prompt_embeds.dtype),
                     encoder_hidden_states=prompt_embeds,
                     encoder_attention_mask=prompt_attention_mask,
                     timestep=current_timestep,

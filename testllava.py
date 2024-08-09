@@ -11,9 +11,14 @@ def main():
     model.to("cuda:0")
 
     # prepare image and text prompt, using the appropriate prompt template
-    url = "https://github.com/haotian-liu/LLaVA/blob/1a91fc274d7c35a9b50b3cb29c4247ae5837ce39/images/llava_v1_5_radar.jpg?raw=true"
-    image = Image.open(requests.get(url, stream=True).raw)
-    prompt = "[INST] <image>\nWhat is shown in this image? [/INST]"
+    # url = "https://github.com/haotian-liu/LLaVA/blob/1a91fc274d7c35a9b50b3cb29c4247ae5837ce39/images/llava_v1_5_radar.jpg?raw=true"
+    # image = Image.open(requests.get(url, stream=True).raw)
+    
+    path = "/USERSPACE/lukovdg1/coco2017/val2017/000000529105.jpg"
+    path = "testimage.png"
+    image = Image.open(path)
+    
+    prompt = "[INST] <image>\nDescribe this image in maximum five words. [/INST]"
 
     inputs = processor(prompt, image, return_tensors="pt").to("cuda:0")
 
@@ -56,4 +61,4 @@ def main2():
     
     
 if __name__ == "__main__":
-    main2()
+    main()

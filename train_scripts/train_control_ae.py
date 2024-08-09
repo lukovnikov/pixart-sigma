@@ -7,7 +7,7 @@ from torch.utils.data import DataLoader
 import tqdm
 
 from cocodata import COCOPanopticDataset, COCOPanopticExample
-from torchvision import transforms
+from torchvision import transforms, models
 from PIL import Image
 
 import pytorch_lightning as pl
@@ -25,30 +25,41 @@ def zero_module(module):
 
 
 class ControlSignalEncoder(torch.nn.Module):
-    def __init__(self, inchannels=3, outchannels=4):
+    def __init__(self, inchannels=3, outchannels=4, patchsize=1):
         super().__init__()
         self.inchannels = inchannels
         self.outchannels = outchannels
         self.layers = torch.nn.Sequential(
             torch.nn.Conv2d(inchannels, 32, 3, padding=1),
+            # torch.nn.BatchNorm2d(32),
             torch.nn.SiLU(),
             torch.nn.Conv2d(32, 32, 3, padding=1),
+            # torch.nn.BatchNorm2d(32),
             torch.nn.SiLU(),
             torch.nn.Conv2d(32, 64, 3, padding=1, stride=2),
+            # torch.nn.BatchNorm2d(64),
             torch.nn.SiLU(),
             torch.nn.Conv2d(64, 64, 3, padding=1),
+            # torch.nn.BatchNorm2d(64),
             torch.nn.SiLU(),
             torch.nn.Conv2d(64, 128, 3, padding=1, stride=2),
+            # torch.nn.BatchNorm2d(128),
             torch.nn.SiLU(),
             torch.nn.Conv2d(128, 128, 3, padding=1),
+            # torch.nn.BatchNorm2d(128),
             torch.nn.SiLU(),
             torch.nn.Conv2d(128, 256, 3, padding=1, stride=2),
+            # torch.nn.BatchNorm2d(256),
             # torch.nn.SiLU(),
             # torch.nn.Conv2d(128, 128, 3, padding=1),
-            torch.nn.SiLU(),
-            torch.nn.Conv2d(256, outchannels*2, 1, padding=0),
             # torch.nn.Tanh(),
+            torch.nn.SiLU(),
         )
+        if patchsize == 2:
+            self.layers.append(torch.nn.Conv2d(256, 256, 3, padding=1, stride=2))
+            self.layers.append(torch.nn.SiLU())
+        
+        self.layers.append(torch.nn.Conv2d(256, outchannels*2, 1, padding=0))
         self.zeroconv = None
         
     def forward(self, x):
@@ -62,7 +73,7 @@ class ControlSignalEncoder(torch.nn.Module):
     
 
 class ControlSignalDecoder(torch.nn.Module):
-    def __init__(self, inchannels=4, outchannels=3):
+    def __init__(self, inchannels=4, outchannels=3, patchsize=1):
         super().__init__()
         self.inchannels = inchannels
         self.outchannels = outchannels
@@ -75,33 +86,168 @@ class ControlSignalDecoder(torch.nn.Module):
             nn.Conv2d(128, 128, kernel_size=3, padding=1),
             # nn.SiLU(),
             # nn.Conv2d(128, 128, kernel_size=3, padding=1),
+            # nn.BatchNorm2d(128),
             nn.SiLU(),
             nn.ConvTranspose2d(128, 64, kernel_size=KSIZE, padding=PAD, output_padding=OUTPAD, stride=2),
             nn.SiLU(),
             nn.Conv2d(64, 64, kernel_size=3, padding=1),
+            # nn.BatchNorm2d(64),
             # nn.SiLU(),
             # nn.Conv2d(64, 64, kernel_size=3, padding=1),
             nn.SiLU(),
             nn.ConvTranspose2d(64, 32, kernel_size=KSIZE, padding=PAD, output_padding=OUTPAD, stride=2),
             nn.SiLU(),
             nn.Conv2d(32, outchannels, kernel_size=3, padding=1),
+            # nn.BatchNorm2d(outchannels),
             nn.SiLU(),
             nn.Conv2d(outchannels, outchannels, kernel_size=3, padding=1),
             # nn.Sigmoid(),
         )
+        if patchsize == 2:
+            extralayers = torch.nn.Sequential(
+                nn.ConvTranspose2d(inchannels, inchannels, kernel_size=KSIZE, padding=PAD, output_padding=OUTPAD, stride=2),
+                nn.SiLU(),
+                nn.Conv2d(inchannels, inchannels, kernel_size=3, padding=1),
+                # nn.BatchNorm2d(inchannels),
+                nn.SiLU()
+            )
+            self.layers = extralayers + self.layers
         
     def forward(self, z):
         for layer in self.layers:
             z = layer(z)
         return z
     
+
+
+class ControlSignalEncoderV2(torch.nn.Module):
+    mult = 2
+    def __init__(self, inchannels=3, outchannels=4, patchsize=1):
+        super().__init__()
+        self.inchannels = inchannels
+        self.outchannels = outchannels
+        
+        self.layers = torch.nn.Sequential(
+            torch.nn.Conv2d(inchannels, 32 * self.mult, 3, padding=1),
+            torch.nn.BatchNorm2d(32 * self.mult),
+            torch.nn.SiLU(),
+            torch.nn.Conv2d(32 * self.mult, 32 * self.mult, 3, padding=1),
+            torch.nn.BatchNorm2d(32 * self.mult),
+            torch.nn.SiLU(),
+            torch.nn.Conv2d(32 * self.mult, 64 * self.mult, 3, padding=1, stride=2),
+            torch.nn.BatchNorm2d(64 * self.mult),
+            torch.nn.SiLU(),
+            torch.nn.Conv2d(64 * self.mult, 64 * self.mult, 3, padding=1),
+            torch.nn.BatchNorm2d(64 * self.mult),
+            torch.nn.SiLU(),
+            torch.nn.Conv2d(64 * self.mult, 128 * self.mult, 3, padding=1, stride=2),
+            torch.nn.BatchNorm2d(128 * self.mult),
+            torch.nn.SiLU(),
+            torch.nn.Conv2d(128 * self.mult, 128 * self.mult, 3, padding=1),
+            torch.nn.BatchNorm2d(128 * self.mult),
+            torch.nn.SiLU(),
+            torch.nn.Conv2d(128 * self.mult, 256 * self.mult, 3, padding=1, stride=2),
+            torch.nn.BatchNorm2d(256 * self.mult),
+            torch.nn.SiLU(),
+            torch.nn.Conv2d(128 * self.mult, 256 * self.mult, 3, padding=1, stride=2),
+            torch.nn.BatchNorm2d(256 * self.mult),
+            torch.nn.SiLU(),
+        )
+        if patchsize == 2:
+            self.layers.append(torch.nn.Conv2d(256 * self.mult, 256 * self.mult, 3, padding=1, stride=2))
+            self.layers.append(torch.nn.SiLU())
+        
+        self.layers.append(torch.nn.Conv2d(256 * self.mult, outchannels*2, 1, padding=0))
+        self.zeroconv = None
+        
+    def forward(self, x):
+        x = x.float()
+        for layer in self.layers:
+            x = layer(x)
+        mu, logvar = x[:, :self.outchannels], x[:, self.outchannels:]
+        if self.zeroconv is not None:
+            mu = self.zeroconv(mu)
+        return mu, logvar
+    
+
+class ControlSignalDecoderV2(torch.nn.Module):
+    mult = 2
+    
+    def __init__(self, inchannels=4, outchannels=3, patchsize=2):
+        super().__init__()
+        self.inchannels = inchannels
+        self.outchannels = outchannels
+        PAD = 0
+        OUTPAD = 0
+        KSIZE = 2
+        self.layers = torch.nn.Sequential(
+            nn.ConvTranspose2d(inchannels, 128 * self.mult, kernel_size=KSIZE, padding=PAD, output_padding=OUTPAD, stride=2),
+            nn.SiLU(),
+            nn.Conv2d(128 * self.mult, 128 * self.mult, kernel_size=3, padding=1),
+            nn.BatchNorm2d(128 * self.mult),
+            nn.SiLU(),
+            nn.ConvTranspose2d(128 * self.mult, 64 * self.mult, kernel_size=KSIZE, padding=PAD, output_padding=OUTPAD, stride=2),
+            nn.SiLU(),
+            nn.Conv2d(64 * self.mult, 64 * self.mult, kernel_size=3, padding=1),
+            nn.BatchNorm2d(64 * self.mult),
+            nn.SiLU(),
+            nn.ConvTranspose2d(64 * self.mult, 32 * self.mult, kernel_size=KSIZE, padding=PAD, output_padding=OUTPAD, stride=2),
+            nn.SiLU(),
+            nn.Conv2d(32 * self.mult, outchannels, kernel_size=3, padding=1),
+            nn.BatchNorm2d(outchannels),
+            nn.SiLU(),
+            nn.Conv2d(outchannels, outchannels, kernel_size=3, padding=1),
+        )
+        if patchsize == 2:
+            extralayers = torch.nn.Sequential(
+                nn.ConvTranspose2d(inchannels, inchannels, kernel_size=KSIZE, padding=PAD, output_padding=OUTPAD, stride=2),
+                nn.SiLU(),
+                nn.Conv2d(inchannels, inchannels, kernel_size=3, padding=1),
+                nn.BatchNorm2d(inchannels),
+                nn.SiLU()
+            )
+            self.layers = extralayers + self.layers
+        
+    def forward(self, z):
+        for layer in self.layers:
+            z = layer(z)
+        return z
+    
+    
+class ControlSignalEncoderV3(torch.nn.Module):
+    
+    def __init__(self, inchannels=3, outchannels=4, patchsize=1):
+        super().__init__()
+        self.inchannels = inchannels
+        self.outchannels = outchannels
+        
+        self.resnet = create_resnet_encoder(inchannels)
+        
+        self.layers = torch.nn.Sequential()
+        
+        if patchsize == 2:
+            self.layers.append(torch.nn.Conv2d(512, 512, 3, padding=1, stride=2))
+            self.layers.append(torch.nn.SiLU())
+        
+        self.layers.append(torch.nn.Conv2d(512, outchannels*2, 1, padding=0))
+        self.zeroconv = None
+        
+    def forward(self, x):
+        x = self.resnet(x)
+        for layer in self.layers:
+            x = layer(x)
+        mu, logvar = x[:, :self.outchannels], x[:, self.outchannels:]
+        if self.zeroconv is not None:
+            mu = self.zeroconv(mu)
+        return mu, logvar
+    
         
 class ControlSignalVAE(pl.LightningModule):
-    def __init__(self, pixelchannels=3, latentchannels=4, lamda=0.1):
+    def __init__(self, pixelchannels=3, latentchannels=4, lamda=0.1, patchsize=1):
         super().__init__()
         self.lamda = lamda
-        self.encoder = ControlSignalEncoder(pixelchannels, latentchannels)
-        self.decoder = ControlSignalDecoder(latentchannels, pixelchannels)
+        self.encoder = ControlSignalEncoderV3(pixelchannels, latentchannels, patchsize=patchsize)
+        self.decoder = ControlSignalDecoderV2(latentchannels, pixelchannels, patchsize=patchsize)
         
     def reparameterize(self, mu, logvar):
         std = logvar.mul(0.5).exp_()
@@ -128,8 +274,6 @@ class ControlSignalVAE(pl.LightningModule):
         mu, logvar = self.encoder(x)
         xhat = self.decoder(mu)
         return xhat, mu, logvar
-        
-    
     
     def configure_optimizers(self):
         return torch.optim.Adam(self.parameters(), lr=1e-4)
@@ -184,7 +328,7 @@ class AccumulatedDict(object):
     def aggregate(self):
         ret = {}
         for k in self.sums:
-            ret[k] = self.sums[k] / self.counts[k]
+            ret[k] = self.sums[k] / max(self.counts[k], 1e-3)
         return ret        
     
     
@@ -216,17 +360,72 @@ def objectmasks_to_pil(x, colors):
     return ret
     
     
-def main(epochs=100, gpu=0, outdir="_test_control_ae_output", batsize=32, lamda=0.1, plotevery=200):
+def collate_fn(listofdicts):
+    ret = {}
+    for k in listofdicts[0]:
+        ret[k] = []
+        
+    for d in listofdicts:
+        assert set(d.keys()) == set(ret.keys())
+        for k, v in d.items():
+            ret[k].append(v)
+    
+    for k in ret:
+        if isinstance(ret[k][0], torch.Tensor):
+            ret[k] = torch.stack(ret[k], 0)
+            
+    return ret
+
+
+class MyResNet(models.ResNet):
+    def _forward_impl(self, x: torch.Tensor) -> torch.Tensor:
+        # See note [TorchScript super()]
+        x = self.conv1(x)
+        x = self.bn1(x)
+        x = self.relu(x)
+        # x = self.maxpool(x)
+
+        x = self.layer1(x)
+        x = self.layer2(x)
+        x = self.layer3(x)
+        x = self.layer4(x)
+
+        # x = self.avgpool(x)
+        # x = torch.flatten(x, 1)
+        # x = self.fc(x)
+
+        return x
+
+
+def create_resnet_encoder(inpchannels=21):
+    model = models.resnet18()
+    # model.conv1 = torch.nn.Conv2d(inpchannels, 64, 7, stride=1, padding=3, bias=False)
+    model.conv1 = torch.nn.Conv2d(inpchannels, 64, 1, stride=1, padding=0, bias=False)
+    model.avgpool = None
+    model.fc = None
+    
+    model.__class__ = MyResNet
+    
+    # try:
+    x = torch.randn(1, 21, 512, 512)
+    y = model(x)
+    print(y.shape)
+    return model
+    
+    
+    
+def main(epochs=2, gpu=0, outdir="control_ae_output_v2_controlnet", batsize=32, lamda=0.00001, plotevery=200, saveevery=200, patchsize=1, latentchannels=4, split="train"):
+    
     NUMOBJ = 20
-    model = ControlSignalVAE(pixelchannels=NUMOBJ+1, lamda=lamda)
+    model = ControlSignalVAE(pixelchannels=NUMOBJ+1, latentchannels=latentchannels, lamda=lamda, patchsize=patchsize)
     
     randomcolors = [randomcolor_hsv() for _ in range(NUMOBJ+1)]
     
     device = torch.device("cuda", gpu)    
     
-    cocodataset = COCOPanopticDataset(maindir="/USERSPACE/lukovdg1/coco2017", split="train", upscale_to=512, max_masks=NUMOBJ)
+    cocodataset = COCOPanopticDataset(maindir="/USERSPACE/lukovdg1/coco2017", split=split, upscale_to=512, max_masks=NUMOBJ, useinstances=True)
     print(len(cocodataset))
-    dl = DataLoader(cocodataset, batch_size=batsize, num_workers=10)
+    dl = DataLoader(cocodataset, batch_size=batsize, num_workers=10, collate_fn=collate_fn)
     
     model.to(device)
     optimizer = torch.optim.Adam(model.parameters(), lr=5e-4) 
@@ -259,6 +458,14 @@ def main(epochs=100, gpu=0, outdir="_test_control_ae_output", batsize=32, lamda=
                         showimgs_r.append(objectmasks_to_pil(xr[j], randomcolors))
                     gridimage = image_grid(showimgs + showimgs_r, 2, len(showimgs))
                     gridimage.save(outpath / "images" / f"reconstr_{global_step}.png")
+                    
+            if global_step % saveevery == 0 and global_step > 0:
+                torch.save(model.state_dict(), outpath / "ae.pth")
+                torch.save(model.encoder.state_dict(), outpath / "encoder.pth")
+                
+                agg = accdict.aggregate()
+                print(f"Epoch {epoch}/{epochs}, batch {i}/{len(dl)}: mse={agg['reconloss']:.6f}, kld={agg['kld']:.6f}")
+                accdict.reset()
                 
             outdict = model.training_step(x, None)
             accdict.add(outdict)
@@ -267,14 +474,14 @@ def main(epochs=100, gpu=0, outdir="_test_control_ae_output", batsize=32, lamda=
             optimizer.step()
             global_step += 1
             
-            
                     
         agg = accdict.aggregate()
-        
             
         torch.save(model.state_dict(), outpath / "ae.pth")
         torch.save(model.encoder.state_dict(), outpath / "encoder.pth")
-        print(f"Epoch {epoch}: mse={agg['reconloss']}, kld={agg['kld']}")
+        print(f"Epoch {epoch}/{epochs}: mse={agg['reconloss']:.6f}, kld={agg['kld']:.6f}")
+        
+        accdict.reset()
             
             
             
