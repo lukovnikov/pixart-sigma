@@ -168,3 +168,10 @@ train_scripts/**/*-finetuned-*
 pixart-fulltune_pixelart
 pixart-loratune_pixelart
 lightning_logs
+
+testimages/
+testimages2/
+*checkpoint-*
+*logs/
+*saved-*
+control_experiments_v2/

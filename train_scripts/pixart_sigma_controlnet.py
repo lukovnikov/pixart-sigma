@@ -13,11 +13,14 @@
 # limitations under the License.
 
 from copy import deepcopy
+from functools import partial
 import html
 import inspect
 import re, os
 import urllib.parse as ul
 from typing import Any, Callable, Dict, List, Optional, Tuple, Union
+
+from minlora import add_lora, apply_to_lora, disable_lora, enable_lora, get_lora_params, merge_lora, name_is_lora, remove_lora, load_multiple_lora, select_lora, LoRAParametrization, get_lora_state_dict
 
 import torch
 
@@ -148,9 +151,8 @@ class FeatureGate(torch.nn.Module):
 
 
 class PixArtTransformer2DModelWithControlNet(PixArtTransformer2DModel):
-    def initialize_adapter(self, control_blocks, control_encoder, use_identlin=False):
+    def initialize_adapter(self, control_blocks, use_identlin=False):
         self.control_blocks = torch.nn.ModuleList(control_blocks)
-        self.control_encoder = control_encoder
         
         self.zeroconvs = torch.nn.ModuleList([None for _ in self.control_blocks])
         
@@ -169,24 +171,27 @@ class PixArtTransformer2DModelWithControlNet(PixArtTransformer2DModel):
             self.zeroconvs = torch.nn.ModuleList([
                 FeatureGate(block.ff.net[2].out_features) if block is not None else None for block in self.control_blocks
             ])
-        
-    def initialize_simple_adapter(self, connectors, control_encoder2):
-        self.simple_connectors = torch.nn.ModuleList(connectors)
-        self.simple_encoder = control_encoder2
     
     @classmethod
-    def adapt(cls, main, control_encoder=None, control_encoder2=None, num_layers=-1, use_controlnet=False, use_adapters=False, use_identlin=False):
-        control_blocks = [None] * len(main.transformer_blocks)
+    def adapt(cls, main, control_encoder=None, control_encoder2=None, num_layers=-1, use_controlnet=False, use_adapters=False, use_controllora=False, lora_rank=64, use_identlin=False):
+        main.__class__ = cls
+        main.control_encoder, main.simple_encoder, main.control_blocks, main.zeroconvs, main.simple_connectors = None, None, None, None, None
+        
+        if control_encoder is not None:
+            main.control_encoder = control_encoder
+        if control_encoder2 is not None:
+            main.simple_encoder = control_encoder2
+            
         if use_controlnet:
+            control_blocks = [None] * len(main.transformer_blocks)
             for i in range(len(main.transformer_blocks)):
                 if num_layers == -1 or i < num_layers:
                     control_blocks[i] = deepcopy(main.transformer_blocks[i])
         
-        main.__class__ = cls
-        main.initialize_adapter(control_blocks, control_encoder, use_identlin=use_identlin)
+            main.initialize_adapter(control_blocks, use_identlin=use_identlin)
         
-        connectors = [None] * len(main.transformer_blocks)
         if use_adapters:
+            connectors = [None] * len(main.transformer_blocks)
             tm_dim = main.transformer_blocks[0].ff.net[2].out_features
             for i in range(len(main.transformer_blocks)):
                 connectors[i] = torch.nn.Sequential(
@@ -195,16 +200,32 @@ class PixArtTransformer2DModelWithControlNet(PixArtTransformer2DModel):
                     torch.nn.Linear(tm_dim, tm_dim),
                 )
                 
-        main.initialize_simple_adapter(connectors, control_encoder2)
+            main.simple_connectors = torch.nn.ModuleList(connectors)
+            
+        if use_controllora:
+            lora_config = {  # specify which layers to add lora to, by default only add to linear layers
+                torch.nn.Linear: {
+                    "weight": partial(LoRAParametrization.from_linear, rank=lora_rank, lora_alpha=lora_rank),
+                },
+            }
+            add_lora(main.transformer_blocks, lora_config)
         
         return main
     
     def get_trainable_parameters(self):
         ret = []
         if self.control_encoder is not None:
-            ret += list(self.control_encoder.parameters()) + list(self.control_blocks.parameters()) + list(self.zeroconvs.parameters())
+            ret += list(self.control_encoder.parameters())
+        if self.control_blocks is not None:
+            ret += list(self.control_blocks.parameters())
+        if self.zeroconvs is not None:
+            ret += list(self.zeroconvs.parameters())
         if self.simple_encoder is not None:
-            ret += list(self.simple_encoder.parameters()) + list(self.simple_connectors.parameters())
+            ret += list(self.simple_encoder.parameters()) 
+        if self.simple_connectors is not None:
+            ret += list(self.simple_connectors.parameters())
+        
+        ret += list(get_lora_params(self))
         
         return ret
     
@@ -213,6 +234,8 @@ class PixArtTransformer2DModelWithControlNet(PixArtTransformer2DModel):
         for k, v in self.state_dict().items():
             if k.split(".")[0] in {"control_encoder", "control_blocks", "zeroconvs", "simple_encoder", "simple_connectors"}:
                 ret[k] = v
+        for k, v in get_lora_state_dict(self).items():
+            ret[k] = v
         return ret
         
     def forward(
@@ -319,7 +342,11 @@ class PixArtTransformer2DModelWithControlNet(PixArtTransformer2DModel):
             encoder_hidden_states = encoder_hidden_states.view(batch_size, -1, hidden_states.shape[-1])
 
         # 2. Blocks
-        for block, control_block, zeroconv, simple_connector in zip(self.transformer_blocks, self.control_blocks, self.zeroconvs, self.simple_connectors):
+        for i, block in enumerate(self.transformer_blocks):
+            control_block = self.control_blocks[i] if self.control_blocks is not None else None
+            zeroconv = self.zeroconvs[i] if self.zeroconvs is not None else None
+            simple_connector = self.simple_connectors[i] if self.simple_connectors is not None else None
+            
             hidden_states_in = hidden_states
             if simple_connector is not None:
                 hidden_states_in += simple_connector(simple_latents)
