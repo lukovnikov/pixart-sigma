@@ -175,12 +175,10 @@ class PixArtTransformer2DModelWithControlNet(PixArtTransformer2DModel):
     @classmethod
     def adapt(cls, main, control_encoder=None, control_encoder2=None, num_layers=-1, use_controlnet=False, use_adapters=False, use_controllora=False, lora_rank=64, use_identlin=False):
         main.__class__ = cls
-        main.control_encoder, main.simple_encoder, main.control_blocks, main.zeroconvs, main.simple_connectors = None, None, None, None, None
+        main.control_blocks, main.zeroconvs, main.simple_connectors = None, None, None
         
-        if control_encoder is not None:
-            main.control_encoder = control_encoder
-        if control_encoder2 is not None:
-            main.simple_encoder = control_encoder2
+        main.control_encoder = control_encoder
+        main.simple_encoder = control_encoder2
             
         if use_controlnet:
             control_blocks = [None] * len(main.transformer_blocks)

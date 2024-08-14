@@ -3,19 +3,17 @@ import math
 from PIL import Image, ImageDraw
 import json
 from pathlib import Path
-from torch.utils.data import Dataset, IterableDataset, DataLoader
+from torch.utils.data import Dataset, DataLoader
 import tqdm
 from transformers import CLIPTokenizer
 from torchvision.transforms.functional import to_tensor, to_pil_image
 import random
 import torch
 from torch.nn.utils.rnn import pad_sequence
-import itertools
 import numpy as np
 import colorsys
-from einops import rearrange, repeat
+# from einops import rearrange, repeat
 import re
-import cv2 as cv
 
 
 def _tokenize_annotated_prompt(prompt, tokenizer, minimize_length=False):
