@@ -852,7 +852,7 @@ class Validator:
         for example in self.examples:
             images.append(
                 self.pipeline(example["captions"][0], control_image=example["cond_image"][None].to(device, dtype=self.weight_dtype), num_inference_steps=20, generator=generator, height=512, width=512).images[0])
-            cond_images.append(masktensor_to_colorimage(example["cond_image"]))
+            cond_images.append(masktensor_to_colorimage(example["cond_image"], bw=True))
             captions.append(example["captions"][0])
 
         self.pipeline.transformer = None
@@ -1212,8 +1212,9 @@ def mainfire_controllora(
 def mainfire_simpleadapt_controllora(
         train_data_dir="/USERSPACE/lukovdg1/coco2017",
         # use_identlin=True,
-        startfrom="/USERSPACE/lukovdg1/pixart-sigma/train_scripts/control_experiments_v2/pixart_coco_simpleadapters",
-        output_dir="/USERSPACE/lukovdg1/pixart-sigma/train_scripts/control_experiments_v2/pixart_coco_simpleadapters+controllora",
+        # startfrom="/USERSPACE/lukovdg1/pixart-sigma/train_scripts/control_experiments_v2/pixart_coco_simpleadapters",
+        # output_dir="/USERSPACE/lukovdg1/pixart-sigma/train_scripts/control_experiments_v2/pixart_coco_simpleadapters+controllora",
+        output_dir="/USERSPACE/lukovdg1/pixart-sigma/train_scripts/control_experiments_v2/pixart_coco_controllora",
         # resume_from_checkpoint="latest",
         pretrained_model_name_or_path="PixArt-alpha/PixArt-Sigma-XL-2-512-MS",
         use_controllora=True,
@@ -1327,24 +1328,29 @@ def mainfire_controlnet(
 # DONE: write dataloading for COCO Instances that doesn't transform them to RGB and back
 # DONE: debug and start training with COCO Instances
 
-# DONE: train simple adapters with 4 GPUs and total batch size 32 for 50k steps
-# TODO: evaluate simple adapters
+# DONE: train simple adapters with total batch size 32 for 50k steps
+# DONE: checked simple adapters
 # NOTYET: try refine simple adapters with lora and control encoder 1 (basically control-lora + simple adapters)
 #    [ ]: load differently pretrained model
 #    [ ]: add additional components
 #    [ ]: train all additional components (or just the ones added?)
 
-# TODO: train controlnet with 4 GPU's and total batch size 32 for 50k steps
+# TODO: train controlnet with total batch size 32 for 50k steps
 #    * appears to work already after 10k steps
-# TODO: properly train control-lora with batch size 32 and 50k steps
-# TODO: try HED controlnet to see how fast it trains 
+#    * works pretty well after 20k-30k steps
+
+# NOTYET: try HED controlnet to see how fast it trains 
 # TODO: implement attention learning
-#    [ ]: use F30k entities or caption all COCO objects using LLAVA
-#    [ ]: modify model to classify how to mix different masked version of attention (region-matching, other regions, other)
+#    [V]: use F30k entities or caption all COCO objects using LLAVA
+#    [V]: write code to load mask captions
+#    [ ]: write code to preprocess the mask captions
+#    [ ]: modify model to classify how to use localized descriptions
 #    [ ]: train
+
+# DONE: properly train control-lora with batch size 32 and 50k steps --> DOESN'T WORK
 # TODO: try simple adapters + lora
 
 
 if __name__ == "__main__":
-    fire.Fire(mainfire_controlnet)
-    # fire.Fire(mainfire_controllora)
+    # fire.Fire(mainfire_controlnet)
+    fire.Fire(mainfire_controllora)

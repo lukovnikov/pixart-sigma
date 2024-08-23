@@ -112,6 +112,13 @@ def parse_args(inpargs):
         default=None,
         help="The config of the Dataset, leave as None if there's only one config.",
     )
+    
+    parser.add_argument(
+        "--prefix",
+        type=str,
+        default=None,
+        help="Prompt prefix",
+    )
     parser.add_argument(
         "--train_data_dir", "--traindir",
         type=str,
@@ -448,14 +455,17 @@ def load_data(args, accelerator, tokenizer):
     # We need to tokenize input captions and transform the images.
     def tokenize_captions(examples, is_train=True, proportion_empty_prompts=0., max_length=120):
         captions = []
+        prefix = ""
+        if hasattr(args, "prefix") and args.prefix is not None:
+            prefix = args.prefix + " "
         for caption in examples[caption_column]:
             if random.random() < proportion_empty_prompts:
-                captions.append("")
+                captions.append(prefix + "")
             elif isinstance(caption, str):
-                captions.append(caption)
+                captions.append(prefix + caption)
             elif isinstance(caption, (list, np.ndarray)):
                 # take a random caption if there are multiple
-                captions.append(random.choice(caption) if is_train else caption[0])
+                captions.append(prefix + (random.choice(caption) if is_train else caption[0]))
             else:
                 raise ValueError(
                     f"Caption column `{caption_column}` should contain either strings or lists of strings."
@@ -705,19 +715,14 @@ def main(args):
                 f"Checkpoint '{args.resume_from_checkpoint}' does not exist. Starting a new training run."
             )
             args.resume_from_checkpoint = None
-            initial_global_step = 0
         else:
             accelerator.print(f"\n Resuming from checkpoint {path} \n")
             accelerator.load_state(os.path.join(args.output_dir, path))
             global_step = int(path.split("-")[1])
 
-            initial_global_step = global_step
-    else:
-        initial_global_step = 0
-
     progress_bar = tqdm(
         range(0, args.num_train_steps),
-        initial=initial_global_step,
+        initial=global_step,
         desc="Steps",
         # Only show the progress bar once on each machine.
         disable=not accelerator.is_local_main_process,
@@ -725,7 +730,8 @@ def main(args):
 
     train_dl_iter = iter(train_dataloader)
     
-    for _ in range(global_step, args.num_train_steps):
+    # for _ in range(global_step, args.num_train_steps):
+    while True:
         transformer.train()
         train_loss = 0.0
         
@@ -840,9 +846,6 @@ def main(args):
             logs = {"step_loss": loss.detach().item(), "lr": lr_scheduler.get_last_lr()[0]}
             progress_bar.set_postfix(**logs)
 
-            if global_step >= args.num_train_steps:
-                break
-
         if accelerator.is_main_process:
             if args.validation_prompt is not None and global_step % args.validate_every == 0:
                 logger.info(
@@ -884,6 +887,9 @@ def main(args):
 
                 del pipeline
                 torch.cuda.empty_cache()
+                
+        if global_step >= args.num_train_steps:
+            break
 
     # Save the lora layers
     accelerator.wait_for_everyone()
@@ -994,7 +1000,50 @@ def mainfire_pixelart(
         args = parse_args(actualargs)
             
         main(args)
+        
+        
+def mainfire_anime(
+        dataset_name = "alfredplpl/anime-with-caption-cc0",
+        output_dir = "/USERSPACE/lukovdg1/pixart-sigma/train_scripts/experiments/pixart_fulltune_animediese",
+        pretrained_model_name_or_path = "PixArt-alpha/PixArt-Sigma-XL-2-512-MS",
+        # validation_prompt="a portrait of a woman",
+        validation_prompt="anidiese The image features a female character with long blue hair, wearing a sailor-style uniform with a white collar and a black bow tie. She has a white headband with cat ears and is holding a book in her left hand. The background is a plain, light grey color.",
+        # validation_prompt="anidiese A portrait of a woman.",
+        resume_from_checkpoint="latest",
+        validate_every=250,
+        learning_rate=1e-5,
+        max_grad_norm=1.,
+        num_train_steps=10000,
+        checkpointing_steps=500,
+        save_every=500,
+        #mixed_precision="fp16",
+        train_batch_size=2,
+        gradient_accumulation_steps=2,
+        gradient_checkpointing=True,
+        seed=1337,
+        caption_column="phi3_caption",
+        prefix="anidiese",
+        **kwargs,
+        ):
+    fargs = locals().copy()
+    dels = ["kwargs", "ModuleType", "_python_view_image_mod"]
+    for d in dels:
+        if d in fargs:
+            del fargs[d]
+    
+    actualargs = []
+    for k, v in fargs.items():
+        if v is True:
+            actualargs.append(f"--{k}")
+        else:
+            actualargs.append(f"--{k}={v}")
+    for k, v in kwargs.items():
+        actualargs.append(f"--{k}={v}")
+        
+    args = parse_args(actualargs)
+        
+    main(args)
 
 
 if __name__ == "__main__":
-    fire.Fire(mainfire_pixelart)
+    fire.Fire(mainfire_anime)

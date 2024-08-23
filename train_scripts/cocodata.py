@@ -89,11 +89,15 @@ def colorgen_hsv(numhues=36):
                 continue
             
             
-def masktensor_to_colorimage(x):
+def masktensor_to_colorimage(x, bw=False):
     """ Takes a mask tensor (C x H x W) where C can be > 3 and returns an RGB image tensor (3 x H x W) with random colors assigned to different masks"""
-    randomcolors = torch.tensor([randomcolor_hsv() for _ in range(x.size(0))])     # (C x 3)
-    indexes = x.max(0)[1]
-    colorimg = randomcolors[indexes].permute(2, 0, 1)
+    if not bw:
+        randomcolors = torch.tensor([randomcolor_hsv() for _ in range(x.size(0))])     # (C x 3)
+        indexes = x.max(0)[1]
+        colorimg = randomcolors[indexes].permute(2, 0, 1)
+    else:
+        colorimg = x.sum(0, keepdim=True)
+        colorimg = colorimg / colorimg.max()
     return colorimg
             
             
@@ -687,12 +691,13 @@ class COCOInstancesDataset(Dataset):
         self.img_dir = Path(self.maindir) / f"{which}2017"
         captionsfile = Path(self.maindir) / "annotations" / f"captions_{which}2017.json"
         instancesfile = Path(self.maindir) / "annotations" / f"instances_{which}2017.json"
+        instancedescriptionsfile = Path(self.maindir) / "annotations" / f"instance_descriptions_{which}2017.json"
         
         print("loading captions")     
         image_db, caption_db = self.load_captions(captionsfile, img_dir=self.img_dir)        # creates image db and caption db
         
         print("loading instances")
-        instance_db = self.load_instances(instancesfile)      # creates category db and panoptic db
+        instance_db = self.load_instances(instancesfile, instancedescriptionsfile)      # creates category db and panoptic db
         
         example_ids = list(image_db.keys())
         
@@ -777,7 +782,7 @@ class COCOInstancesDataset(Dataset):
             
         return image_db, captiondb
             
-    def load_instances(self, instancesfile):
+    def load_instances(self, instancesfile, instancedescriptionsfile=None):
         # load category db
         category_db = {}
         instancesinfo = json.load(open(instancesfile))
@@ -799,9 +804,18 @@ class COCOInstancesDataset(Dataset):
             imgd[mask["image_id"]]["masks"].append(mask)
             
         # load panoptics annotations
+        segment_db = {}
         for imgid, img in imgd.items():
             for mask in img["masks"]:
                 mask["category_name"] = category_db[mask["category_id"]]
+                mask["caption"] = mask["category_name"]
+                segment_db[mask["id"]] = mask
+                
+        if instancedescriptionsfile is not None and Path(instancedescriptionsfile).exists():
+            # load descriptions
+            instancedescriptions = json.load(open(instancedescriptionsfile))
+            for k, v in instancedescriptions.items():
+                segment_db[int(k)]["caption"] = v
             
         return imgd
 
@@ -840,6 +854,7 @@ class COCOInstancesDataset(Dataset):
         
         # 4. pick one caption at random (TODO: or generate one from regions)
         captions = [random.choice(example.captions)]
+        segcaptions = [None for _ in range(self.max_masks + 1)]
     
         # 4. load masks
         ids = list(range(0, self.max_masks+1))
@@ -848,6 +863,7 @@ class COCOInstancesDataset(Dataset):
         for i, (mask) in enumerate(seg_imgtensor.unbind(0)):
             maskid = ids.pop(0)
             cond_imgtensor[maskid] = mask
+            segcaptions[maskid] = example.seg_info[i]["caption"]
             
         if False:
             maskid = ids.pop(0)
@@ -862,13 +878,19 @@ class COCOInstancesDataset(Dataset):
         
         imgtensor = imgtensor[:, crop[0]:crop[0]+cropsize, crop[1]:crop[1]+cropsize]
         cond_imgtensor = cond_imgtensor[:, crop[0]:crop[0]+cropsize, crop[1]:crop[1]+cropsize]
+        
+        # if we cropped such that an object is no longer visible, remove caption
+        for i, croppedmask in enumerate(cond_imgtensor.unbind(0)):
+            if croppedmask.sum() == 0:
+                segcaptions[i] = None
             
         imgtensor = imgtensor * 2 - 1.
         
         ret = { "image": imgtensor, 
                 "cond_image": cond_imgtensor,
                 "captions": captions,
-                "image_path": example.image_path
+                "seg_captions": segcaptions,
+                "image_path": example.image_path,
                 }
         
         for transform in self.transforms:
@@ -899,7 +921,7 @@ def collate_fn(listofdicts):
     
 def main(x=0):
     import pickle
-    cocodataset = COCOInstancesDataset(maindir="/USERSPACE/lukovdg1/coco2017", split="tr", upscale_to=512)
+    cocodataset = COCOInstancesDataset(maindir="/USERSPACE/lukovdg1/coco2017", split="v", upscale_to=512)
     
     # example = cocodataset[0]
     
