@@ -865,6 +865,8 @@ class COCOInstancesDataset(Dataset):
             cond_imgtensor[maskid] = mask
             segcaptions[maskid] = example.seg_info[i]["caption"]
             
+        # cond_imgtensor[0] = torch.where(cond_imgtensor.sum(1) > 0, torch.zeros_like(cond_imgtensor[0]), torch.ones_like(cond_imgtensor[0]))
+            
         if False:
             maskid = ids.pop(0)
             bgrmask = cond_imgtensor.long().sum(0) == 0

@@ -55,25 +55,32 @@ from diffusers.models.attention_processor import Attention, AttnProcessor2_0
 logger = logging.get_logger(__name__)  # pylint: disable=invalid-name
 
 
-def preprocess_example(example, caption_column="captions", proportion_empty_prompts=0, max_length=600, tokenizer=None, device=torch.device("cuda")):
-    captions = [example[caption_column]] + example["seg_captions"]
+def preprocess_example(example, caption_column="captions", proportion_empty_prompts=0, max_length=300, tokenizer=None, omit_global_caption=False, ):
+    globalcaption = example[caption_column]
+    if omit_global_caption:
+        globalcaption = ""
+    captions = [globalcaption] + example["seg_captions"]
     example["seg_input_ids"] = []
     example["seg_attention_mask"] = []
     example["whichlayer"] = []
     for i, seg_caption in enumerate(captions):
         if seg_caption is not None:
+            # if omit_global_caption and i == 0:
+            #     continue
             seg_input_ids, seg_attention_mask = tokenize_caption(caption=seg_caption, proportion_empty_prompts=proportion_empty_prompts, max_length=max_length, tokenizer=tokenizer)
-            example["seg_input_ids"].append(seg_input_ids)
-            example["seg_attention_mask"].append(seg_attention_mask)
-            example["whichlayer"].append(torch.tensor([i], dtype=torch.long, device=seg_input_ids.device))
+            seglen = int((seg_input_ids != 0).float().sum().item())
+            example["seg_input_ids"].append(seg_input_ids[0, :seglen-1])
+            example["whichlayer"].append(torch.ones_like(example["seg_input_ids"][-1]) * i )    # if global caption is not at zero: (i+1))
+    example["seg_input_ids"].append(torch.ones_like(seg_input_ids[0, :1]))
+    example["whichlayer"].append(torch.zeros_like(seg_input_ids[0, :1]))
             
     example["seg_input_ids"] =  torch.cat(example["seg_input_ids"], 0)
-    example["seg_attention_mask"] =  torch.cat(example["seg_attention_mask"], 0)
+    example["seg_attention_mask"] =  torch.ones_like(example["seg_input_ids"])
     example["whichlayer"] =  torch.cat(example["whichlayer"], 0) 
     return example
 
 
-def tokenize_caption(example=None, caption=None, is_train=True, proportion_empty_prompts=0., max_length=120, tokenizer=None, caption_column="captions"):
+def tokenize_caption(example=None, caption=None, is_train=True, proportion_empty_prompts=0., max_length=300, tokenizer=None, caption_column="captions"):
     if random.random() < proportion_empty_prompts:
         caption = ""
     else:
@@ -85,6 +92,10 @@ def tokenize_caption(example=None, caption=None, is_train=True, proportion_empty
         if isinstance(caption, (list, np.ndarray)):
             # take a random caption if there are multiple
             caption = random.choice(caption) if is_train else caption[0]
+        if not caption.endswith("."):
+            caption += "."
+    # if not seg_caption.endswith("."):
+    #     seg_caption += "."
     inputs = tokenizer(caption, max_length=max_length, padding="max_length", truncation=True, return_tensors="pt")
     return inputs.input_ids, inputs.attention_mask
 
@@ -95,73 +106,27 @@ def collate_fn(examples):
     cond_images = torch.stack([example["cond_image"] for example in examples])
     cond_images = cond_images.to(memory_format=torch.contiguous_format).float()
     whichexample, input_ids, attention_mask, whichlayer = [], [], [], []
-    main_input_ids, main_attention_mask = [], []
     for i, example in enumerate(examples):
-        main_input_ids.append(example["seg_input_ids"][0])
-        main_attention_mask.append(example["seg_attention_mask"][0])
-        for seg_input_ids, seg_attention_mask, seg_whichlayer in zip(example["seg_input_ids"], example["seg_attention_mask"], example["whichlayer"]):
-            whichexample.append(torch.tensor(i, dtype=torch.long, device=seg_input_ids.device))
-            input_ids.append(seg_input_ids)
-            attention_mask.append(seg_attention_mask)
-            whichlayer.append(seg_whichlayer)
-    input_ids, attention_mask, whichlayer, whichexample, main_input_ids, main_attention_mask = [torch.stack(x, 0) for x in [input_ids, attention_mask, whichlayer, whichexample, main_input_ids, main_attention_mask]]
+        input_ids.append(example["seg_input_ids"])
+        attention_mask.append(example["seg_attention_mask"])
+        whichlayer.append(example["whichlayer"])
+        # whichexample.append(torch.tensor(i, dtype=torch.long, device=input_ids[-1].device))
+    input_ids, attention_mask, whichlayer = [torch.nn.utils.rnn.pad_sequence(x, batch_first=True) for x in [input_ids, attention_mask, whichlayer]]
     return {"image": images, 
-            "cond_image": cond_images, 
+            "cond_image": cond_images,
             "input_ids": input_ids, 
             "prompt_attention_mask": attention_mask,
-            "whichexample": whichexample,
             "whichlayer": whichlayer,
-            "main_input_ids": main_input_ids,
-            "main_attention_mask": main_attention_mask,
             }
     
 
-def encode_text(batch, encoder, _maxpackedlen=600):
+def encode_text(batch, encoder):
     # minimize length:
-    lens = (batch["input_ids"] != 0).sum(1)
-    maxlen = lens.max()
-    input_ids = batch["input_ids"][:, :maxlen]
-    attention_mask = batch["prompt_attention_mask"][:, :maxlen]
-    whichlayer, whichexample = batch["whichlayer"], batch["whichexample"]
+    input_ids, attention_mask, whichlayer = batch["input_ids"], batch["prompt_attention_mask"], batch["whichlayer"]    
     
     # run encoder model:
-    
-    encoded = encoder(input_ids.to(encoder.device), attention_mask=attention_mask)[0]
-    
-    # rearrange into output variables
-    batsize = whichexample.max() + 1
-    packedlens = torch.tensor([0 for _ in whichexample.unique()], dtype=torch.long, device=encoded.device)
-    for i in range(input_ids.shape[0]):
-        packedlens[whichexample[i].item()] += (input_ids[i] != 0).sum()
-    
-    control_prompt_embeds = torch.zeros(batsize, packedlens.max(), encoded.shape[2], dtype=encoded.dtype, device=encoded.device)
-    control_attention_mask = torch.zeros(batsize, packedlens.max(), dtype=attention_mask.dtype, device=encoded.device)
-    main_prompt_embeds = torch.zeros(batsize, maxlen, encoded.shape[2], dtype=encoded.dtype, device=encoded.device)
-    main_attention_mask = torch.zeros(batsize, maxlen, dtype=attention_mask.dtype, device=encoded.device)
-    control_layer_ids = torch.zeros(batsize, packedlens.max(), dtype=torch.long, device=encoded.device)
-    
-    start = 0
-    prevexampleid = -1
-    for i in range(encoded.shape[0]):
-        exampleid, layerid = whichexample[i].item(), whichlayer[i].item()
-        if exampleid != prevexampleid:
-            start = 0
-            prevexampleid = exampleid
-        l = lens[i]
-        control_prompt_embeds[exampleid, start:start+l] = encoded[i, :l]
-        control_layer_ids[exampleid, start:start+l] = layerid * torch.ones(1, l, dtype=torch.long, device=encoded.device)
-        control_attention_mask[exampleid, start:start+l] = attention_mask[i, :l]
-        if layerid == 0:
-            main_prompt_embeds[exampleid, :l] = encoded[i, :l]
-            main_attention_mask[exampleid, :l] = attention_mask[i, :l]
-        start += l
-        
-    if packedlens.max() > _maxpackedlen:
-        control_prompt_embeds = control_prompt_embeds[:, :_maxpackedlen]
-        control_attention_mask = control_attention_mask[:, :_maxpackedlen]
-        control_layer_ids = control_layer_ids[:, :_maxpackedlen]
-        
-    return main_prompt_embeds, main_attention_mask, control_prompt_embeds, control_attention_mask, control_layer_ids
+    encoded = encoder(input_ids.to(encoder.device), attention_mask=attention_mask)[0]    
+    return encoded, attention_mask, whichlayer
 
 
 
@@ -268,18 +233,21 @@ class CustomAttnProcessor2_0:
     r"""
     Processor for implementing scaled dot-product attention (enabled by default if you're using PyTorch 2.0).
     """
+    
+    mask_attention = True
 
     def __init__(self):
-        if not hasattr(F, "scaled_dot_product_attention"):
+        if not hasattr(torch.nn.functional, "scaled_dot_product_attention"):
             raise ImportError("AttnProcessor2_0 requires PyTorch 2.0, to use it, please upgrade PyTorch to 2.0.")
         
     @classmethod
-    def adapt(cls, obj, attn):
+    def adapt(cls, obj, attn, use_attention_embeddings=False):
         obj.__class__ = cls
         NUM_OBJ_LAYERS = 25
         T5_DIM = 1152
-        attn.obj_layer_embed = torch.nn.Embedding(NUM_OBJ_LAYERS, T5_DIM)
-        torch.nn.init.zeros_(attn.obj_layer_embed.weight)
+        if use_attention_embeddings:
+            attn.obj_layer_embed = torch.nn.Embedding(NUM_OBJ_LAYERS, T5_DIM)
+            torch.nn.init.zeros_(attn.obj_layer_embed.weight)
 
     def __call__(
         self,
@@ -288,7 +256,7 @@ class CustomAttnProcessor2_0:
         encoder_hidden_states: Optional[torch.Tensor] = None,
         attention_mask: Optional[torch.Tensor] = None,
         temb: Optional[torch.Tensor] = None,
-        layer_ids: Optional[torch.Tensor] = None,
+        layer_ids: Optional[torch.Tensor] = None,   # BEWARE: layer ids are +1 higher than the actual index of their object mask in object_masks
         object_masks: Optional[torch.Tensor] = None,
         *args,
         **kwargs,
@@ -332,7 +300,9 @@ class CustomAttnProcessor2_0:
         # embed control layer ids and add them to control_encoder_hidden_states
         # obj_layer_embed = self.obj_layer_embed(layer_ids)
         # obj_layer_embed *= attention_mask.float()[:, :, None]
-        encoder_hidden_states_keys = encoder_hidden_states + attn.obj_layer_embed(layer_ids)              # TODO: add embeddings to keys only
+        encoder_hidden_states_keys = encoder_hidden_states
+        if hasattr(attn, "obj_layer_embed") and attn.obj_layer_embed is not None:
+            encoder_hidden_states_keys = encoder_hidden_states_keys + attn.obj_layer_embed(layer_ids)
         
         key = attn.to_k(encoder_hidden_states_keys)
         value = attn.to_v(encoder_hidden_states)
@@ -347,6 +317,19 @@ class CustomAttnProcessor2_0:
 
         # the output of sdp = (batch, num_heads, seq_len, head_dim)
         # TODO: add support for attn.scale when we move to Torch 2.1
+        
+        if self.mask_attention:
+            object_masks = torch.nn.functional.avg_pool2d(object_masks, 16, 16) > 0
+            # globalonly = torch.where(object_masks.sum(1) > 0, torch.zeros_like(object_masks[:, 0]), torch.ones_like(object_masks[:, 0]))
+            globalonly = torch.ones_like(object_masks[:, 0])
+            object_masks = torch.cat([globalonly[:, None], object_masks], 1)
+            object_masks = object_masks.flatten(2)
+            
+            object_attention_mask = torch.take_along_dim(object_masks, layer_ids[:, :, None], 1)
+            object_attention_mask = (object_attention_mask.transpose(1, 2)[:, None].float() - 1.) * 10000.
+            
+            attention_mask = torch.min(attention_mask, object_attention_mask)
+
         hidden_states = torch.nn.functional.scaled_dot_product_attention(
             query, key, value, attn_mask=attention_mask, dropout_p=0.0, is_causal=False
         )
@@ -393,7 +376,7 @@ class PixArtTransformer2DModelWithLayoutControlNet(PixArtTransformer2DModel):
             ])
     
     @classmethod
-    def adapt(cls, main, control_encoder=None, control_encoder2=None, num_layers=-1, use_controlnet=False, use_adapters=False, use_controllora=False, lora_rank=64, use_identlin=False):
+    def adapt(cls, main, control_encoder=None, control_encoder2=None, num_layers=-1, use_controlnet=False, use_adapters=False, use_controllora=False, lora_rank=64, use_identlin=False, use_attention_embeddings=False):
         main.__class__ = cls
         main.control_blocks, main.zeroconvs, main.simple_connectors = None, None, None
         
@@ -410,7 +393,7 @@ class PixArtTransformer2DModelWithLayoutControlNet(PixArtTransformer2DModel):
                     
             for block in main.control_blocks:
                 if block is not None:
-                    CustomAttnProcessor2_0.adapt(block.attn2.processor, block.attn2)
+                    CustomAttnProcessor2_0.adapt(block.attn2.processor, block.attn2, use_attention_embeddings=use_attention_embeddings)
         
         if use_adapters:
             connectors = [None] * len(main.transformer_blocks)
@@ -509,12 +492,10 @@ class PixArtTransformer2DModelWithLayoutControlNet(PixArtTransformer2DModel):
             If `return_dict` is True, an [`~models.transformer_2d.Transformer2DModelOutput`] is returned, otherwise a
             `tuple` where the first element is the sample tensor.
         """
-        encoder_hidden_states, control_encoder_hidden_states, control_layer_ids = encoder_hidden_states
-        encoder_attention_mask, control_encoder_attention_mask = encoder_attention_mask
+        encoder_hidden_states, control_layer_ids = encoder_hidden_states
+        encoder_attention_mask = encoder_attention_mask
         
-        if cross_attention_kwargs is None:
-            cross_attention_kwargs = {}
-        cross_attention_kwargs.update({"layer_ids": control_layer_ids, "object_masks": control_image})
+        control_cross_attention_kwargs = {"layer_ids": control_layer_ids, "object_masks": control_image}
         
         # Encode control image and add to hidden states
         if self.control_encoder is not None:
@@ -550,8 +531,6 @@ class PixArtTransformer2DModelWithLayoutControlNet(PixArtTransformer2DModel):
         if encoder_attention_mask is not None and encoder_attention_mask.ndim == 2:
             encoder_attention_mask = (1 - encoder_attention_mask.to(hidden_states.dtype)) * -10000.0
             encoder_attention_mask = encoder_attention_mask.unsqueeze(1)
-            control_encoder_attention_mask = (1 - control_encoder_attention_mask.to(hidden_states.dtype)) * -10000.0
-            control_encoder_attention_mask = control_encoder_attention_mask.unsqueeze(1)
 
         # 1. Input
         batch_size = hidden_states.shape[0]
@@ -571,8 +550,6 @@ class PixArtTransformer2DModelWithLayoutControlNet(PixArtTransformer2DModel):
         if self.caption_projection is not None:
             encoder_hidden_states = self.caption_projection(encoder_hidden_states)
             encoder_hidden_states = encoder_hidden_states.view(batch_size, -1, hidden_states.shape[-1])
-            control_encoder_hidden_states = self.caption_projection(control_encoder_hidden_states)
-            control_encoder_hidden_states = control_encoder_hidden_states.view(batch_size, -1, hidden_states.shape[-1])
 
         # 2. Blocks
         for i, block in enumerate(self.transformer_blocks):
@@ -617,10 +594,10 @@ class PixArtTransformer2DModelWithLayoutControlNet(PixArtTransformer2DModel):
                         create_custom_forward(control_block),
                         hidden_states_control,
                         attention_mask,
-                        control_encoder_hidden_states,
-                        control_encoder_attention_mask,
+                        encoder_hidden_states,
+                        encoder_attention_mask,
                         timestep,
-                        cross_attention_kwargs,
+                        control_cross_attention_kwargs,
                         None,
                         **ckpt_kwargs,
                     )
@@ -643,10 +620,10 @@ class PixArtTransformer2DModelWithLayoutControlNet(PixArtTransformer2DModel):
                     hidden_states_control = control_block(
                         hidden_states_control,
                         attention_mask=attention_mask,
-                        encoder_hidden_states=control_encoder_hidden_states,
-                        encoder_attention_mask=control_encoder_attention_mask,
+                        encoder_hidden_states=encoder_hidden_states,
+                        encoder_attention_mask=encoder_attention_mask,
                         timestep=timestep,
-                        cross_attention_kwargs=cross_attention_kwargs,
+                        cross_attention_kwargs=control_cross_attention_kwargs,
                         class_labels=None,
                     )
                     if self.use_identlin:
@@ -690,6 +667,9 @@ class PixArtSigmaLayoutControlNetPipeline(PixArtSigmaPipeline):
     
     def check_cond(self, condimage, height, width):
         pass        # TODO
+    
+    def set_preprocess_example(self, fn):
+        self.preprocess_example = fn
 
     @torch.no_grad()
     def __call__(
@@ -851,28 +831,28 @@ class PixArtSigmaLayoutControlNetPipeline(PixArtSigmaPipeline):
         do_classifier_free_guidance = guidance_scale > 1.0
         
         # 3. Encode input prompt
-        # MAIN PROMPT ENCODING
-        (
-            prompt_embeds,
-            prompt_attention_mask,
-            negative_prompt_embeds,
-            negative_prompt_attention_mask,
-        ) = self.encode_prompt(
-            prompt,
-            do_classifier_free_guidance,
-            negative_prompt=negative_prompt,
-            num_images_per_prompt=num_images_per_prompt,
-            device=device,
-            prompt_embeds=prompt_embeds,
-            negative_prompt_embeds=negative_prompt_embeds,
-            prompt_attention_mask=prompt_attention_mask,
-            negative_prompt_attention_mask=negative_prompt_attention_mask,
-            clean_caption=clean_caption,
-            max_sequence_length=max_sequence_length,
-        )
-        if do_classifier_free_guidance:
-            prompt_embeds = torch.cat([negative_prompt_embeds, prompt_embeds], dim=0)
-            prompt_attention_mask = torch.cat([negative_prompt_attention_mask, prompt_attention_mask], dim=0)
+        # # MAIN PROMPT ENCODING
+        # (
+        #     prompt_embeds,
+        #     prompt_attention_mask,
+        #     negative_prompt_embeds,
+        #     negative_prompt_attention_mask,
+        # ) = self.encode_prompt(
+        #     prompt,
+        #     do_classifier_free_guidance,
+        #     negative_prompt=negative_prompt,
+        #     num_images_per_prompt=num_images_per_prompt,
+        #     device=device,
+        #     prompt_embeds=prompt_embeds,
+        #     negative_prompt_embeds=negative_prompt_embeds,
+        #     prompt_attention_mask=prompt_attention_mask,
+        #     negative_prompt_attention_mask=negative_prompt_attention_mask,
+        #     clean_caption=clean_caption,
+        #     max_sequence_length=max_sequence_length,
+        # )
+        # if do_classifier_free_guidance:
+        #     prompt_embeds = torch.cat([negative_prompt_embeds, prompt_embeds], dim=0)
+        #     prompt_attention_mask = torch.cat([negative_prompt_attention_mask, prompt_attention_mask], dim=0)
             
         # CONTROL PROMPT ENCODING:
         # create example and preprocess it
@@ -880,35 +860,36 @@ class PixArtSigmaLayoutControlNetPipeline(PixArtSigmaPipeline):
                    "seg_captions": obj_prompts,
                    "cond_image": obj_masks,
                    "image": obj_masks}
-        example = preprocess_example(example, tokenizer=self.tokenizer)
+        example = self.preprocess_example(example, tokenizer=self.tokenizer)
         example = collate_fn([example])
         example = {k: v.to(self.text_encoder.device) for k, v in example.items()}
-        main_prompt_embeds, main_attention_mask, control_prompt_embeds, control_attention_mask, control_layer_ids = encode_text(example, self.text_encoder)
+        prompt_embeds, prompt_attention_mask, layer_ids = encode_text(example, self.text_encoder)
         
+        (
+             prompt_embeds,
+             prompt_attention_mask,
+             negative_prompt_embeds,
+             negative_prompt_attention_mask,
+        ) = self.encode_prompt(
+             prompt,
+             do_classifier_free_guidance,
+             negative_prompt=negative_prompt,
+             num_images_per_prompt=num_images_per_prompt,
+             device=device,
+             prompt_embeds=prompt_embeds,
+             negative_prompt_embeds=negative_prompt_embeds,
+             prompt_attention_mask=prompt_attention_mask,
+             negative_prompt_attention_mask=negative_prompt_attention_mask,
+             clean_caption=clean_caption,
+             max_sequence_length=max_sequence_length,
+        )
         if do_classifier_free_guidance:
-            (
-                control_prompt_embeds,
-                control_prompt_attention_mask,
-                control_negative_prompt_embeds,
-                control_negative_prompt_attention_mask,
-            ) = self.encode_prompt(
-                None,
-                do_classifier_free_guidance,
-                negative_prompt=negative_prompt,
-                num_images_per_prompt=num_images_per_prompt,
-                device=device,
-                prompt_embeds=control_prompt_embeds,
-                prompt_attention_mask=control_attention_mask,
-                clean_caption=clean_caption,
-                max_sequence_length=max_sequence_length,
-            )
-            control_prompt_embeds = torch.cat([control_negative_prompt_embeds, control_prompt_embeds], dim=0)
-            control_prompt_attention_mask = torch.cat([control_negative_prompt_attention_mask, control_prompt_attention_mask], dim=0)
-            control_negative_layer_ids = torch.zeros_like(control_layer_ids)
-            control_layer_ids = torch.cat([control_negative_layer_ids, control_layer_ids], dim=0)
+             prompt_embeds = torch.cat([negative_prompt_embeds, prompt_embeds], dim=0)
+             prompt_attention_mask = torch.cat([negative_prompt_attention_mask, prompt_attention_mask], dim=0)
+             negative_layer_ids = torch.zeros_like(layer_ids)
+             layer_ids = torch.cat([negative_layer_ids, layer_ids], 0)
             
-        prompt_embeds = (prompt_embeds, control_prompt_embeds, control_layer_ids)
-        prompt_attention_mask = (prompt_attention_mask, control_prompt_attention_mask)
+        prompt_embeds = (prompt_embeds, layer_ids)
 
         dtype = prompt_embeds[0].dtype
 
