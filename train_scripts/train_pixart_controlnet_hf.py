@@ -595,7 +595,7 @@ def load_pretrained(path, device=torch.device("cuda"), return_pipe=True, load_sa
     with open(path / "args.json") as f:
         args = argparse.Namespace(**json.load(f))
         
-    if hasattr(args, "startfrom"):
+    if hasattr(args, "startfrom") and args.startfrom is not None:
         transformer, tokenizer, text_encoder, noise_scheduler, vae, weight_dtype = load_pretrained(args.startfrom, device=device, return_pipe=False, load_saved_state_dict=True)
     else:
         transformer, tokenizer, text_encoder, noise_scheduler, vae, weight_dtype = load_model(args, None, device)
@@ -697,9 +697,16 @@ def configure_optimizer(args, trainable_layers, transformer, accelerator):
     return optimizer
 
 
+def default(f, fallback):
+    try:
+        return f()
+    except AttributeError as e:
+        return fallback
+
+
 def adapt_transformer_controlnet(transformer, args=None, control_encoder=None, control_encoder2=None, num_layers=-1, _return_trainable=False, weight_dtype=torch.float32):
     # convert vanilla Transformer model to one that also takes the control signal and has a controlnet branch
-    transformer = PixArtTransformer2DModelWithControlNet.adapt(transformer, control_encoder=control_encoder, control_encoder2=control_encoder2, num_layers=num_layers, use_controlnet=args.use_controlnet, use_adapters=args.use_adapters, use_controllora=args.use_controllora, lora_rank=args.lora_rank, use_identlin=args.use_identlin)
+    transformer = PixArtTransformer2DModelWithControlNet.adapt(transformer, control_encoder=control_encoder, control_encoder2=control_encoder2, num_layers=num_layers, use_controlnet=args.use_controlnet, use_adapters=args.use_adapters, use_controllora=default(lambda: args.use_controllora, False), lora_rank=args.lora_rank, use_identlin=args.use_identlin)
     transformer.to(weight_dtype)
     
     if _return_trainable:

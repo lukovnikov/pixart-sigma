@@ -376,7 +376,7 @@ class PixArtTransformer2DModelWithLayoutControlNet(PixArtTransformer2DModel):
             ])
     
     @classmethod
-    def adapt(cls, main, control_encoder=None, control_encoder2=None, num_layers=-1, use_controlnet=False, use_adapters=False, use_controllora=False, lora_rank=64, use_identlin=False, use_attention_embeddings=False):
+    def adapt(cls, main, control_encoder=None, control_encoder2=None, num_layers=-1, use_controlnet=False, use_adapters=False, use_controllora=False, lora_rank=64, use_identlin=False, use_attention_embeddings=False, use_masked_attention=False):
         main.__class__ = cls
         main.control_blocks, main.zeroconvs, main.simple_connectors = None, None, None
         
@@ -394,6 +394,9 @@ class PixArtTransformer2DModelWithLayoutControlNet(PixArtTransformer2DModel):
             for block in main.control_blocks:
                 if block is not None:
                     CustomAttnProcessor2_0.adapt(block.attn2.processor, block.attn2, use_attention_embeddings=use_attention_embeddings)
+                    if not use_masked_attention:
+                        block.attn2.processor.mask_attention = False
+                    
         
         if use_adapters:
             connectors = [None] * len(main.transformer_blocks)

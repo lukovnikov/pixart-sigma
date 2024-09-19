@@ -15,6 +15,7 @@
 """Fine-tuning script for Stable Diffusion for text2image with support for LoRA."""
 
 import argparse
+import json
 import logging
 import math
 import os
@@ -401,6 +402,8 @@ def validate_args(args):
 DATASET_NAME_MAPPING = {"lambdalabs/pokemon-blip-captions": ("image", "text"),
                         "svjack/pokemon-blip-captions-en-zh": ("image", "en_text")}
 
+SHUFFLE_SUBSELECT = False
+
 
 def load_data(args, accelerator, tokenizer):
     # See Section 3.1. of the paper.
@@ -493,7 +496,10 @@ def load_data(args, accelerator, tokenizer):
 
     with accelerator.main_process_first():
         if args.max_train_samples is not None:
-            dataset["train"] = dataset["train"].shuffle(seed=args.seed).select(range(args.max_train_samples))
+            if SHUFFLE_SUBSELECT:
+                dataset["train"] = dataset["train"].shuffle(seed=args.seed).select(range(args.max_train_samples))
+            else:
+                dataset["train"] = dataset["train"].select(range(args.max_train_samples))
         # Set the training transforms
         train_dataset = dataset["train"].with_transform(preprocess_train)
 
@@ -665,6 +671,10 @@ def save_checkpoint(args, accelerator, transformer, global_step):
 
 
 def main(args):
+    
+    with open(Path(args.output_dir) / "args.json", "w") as f:
+        json.dump(args.__dict__, f, indent=4)
+    
     validate_args(args)
     
     logging_dir = Path(args.output_dir, args.logging_dir)
@@ -1004,25 +1014,26 @@ def mainfire_pixelart(
         
 def mainfire_anime(
         dataset_name = "alfredplpl/anime-with-caption-cc0",
-        output_dir = "/USERSPACE/lukovdg1/pixart-sigma/train_scripts/experiments/pixart_fulltune_animediese",
+        output_dir = "/USERSPACE/lukovdg1/pixart-sigma/train_scripts/experiments/pixart_fulltune_1girl",
         pretrained_model_name_or_path = "PixArt-alpha/PixArt-Sigma-XL-2-512-MS",
         # validation_prompt="a portrait of a woman",
-        validation_prompt="anidiese The image features a female character with long blue hair, wearing a sailor-style uniform with a white collar and a black bow tie. She has a white headband with cat ears and is holding a book in her left hand. The background is a plain, light grey color.",
+        validation_prompt="[1girl] The image features a female character with long blue hair, wearing a sailor-style uniform with a white collar and a black bow tie. She has a white headband with cat ears and is holding a book in her left hand. The background is a plain, light grey color.",
         # validation_prompt="anidiese A portrait of a woman.",
-        resume_from_checkpoint="latest",
+        # resume_from_checkpoint="latest",
         validate_every=250,
         learning_rate=1e-5,
         max_grad_norm=1.,
         num_train_steps=10000,
         checkpointing_steps=500,
-        save_every=500,
+        save_every=2000,
         #mixed_precision="fp16",
         train_batch_size=2,
         gradient_accumulation_steps=2,
         gradient_checkpointing=True,
         seed=1337,
         caption_column="phi3_caption",
-        prefix="anidiese",
+        prefix="[1girl]",
+        max_train_samples=10000,
         **kwargs,
         ):
     fargs = locals().copy()

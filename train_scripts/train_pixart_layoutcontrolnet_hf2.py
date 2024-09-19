@@ -139,6 +139,23 @@ def parse_args(inpargs):
         ),
     )
     
+    parser.add_argument(
+        "--use_bbox",
+        default=False,
+        action="store_true",
+        help=(
+            "Whether to use bbox masks instead of instance masks."
+        ),
+    )
+    
+    parser.add_argument(
+        "--no_masked_attention",
+        default=False,
+        action="store_true",
+        help=(
+            "Whether to use bbox masks instead of instance masks."
+        ),
+    )
     
     parser.add_argument(
         "--omit_global_caption",
@@ -500,13 +517,20 @@ DATASET_NAME_MAPPING = {"lambdalabs/pokemon-blip-captions": ("image", "text"),
                         "svjack/pokemon-blip-captions-en-zh": ("image", "en_text")}
 
 
+def default(f, fallback):
+    try:
+        return f()
+    except AttributeError as e:
+        return fallback
+    
+
 NUMOBJ = 20
 def load_data(args, tokenizer, split="train"):
     # See Section 3.1. of the paper.
     max_length = args.max_token_length
     
     # if accelerator.is_main_process:
-    dataset = COCOInstancesDataset(maindir=args.train_data_dir, split=split, upscale_to=512, max_masks=NUMOBJ)
+    dataset = COCOInstancesDataset(maindir=args.train_data_dir, split=split, upscale_to=512, max_masks=NUMOBJ, use_bbox=default(lambda: args.use_bbox, None))
     
     # with accelerator.is_main_process:
     dataset.transforms.append(partial(preprocess_example, proportion_empty_prompts=args.proportion_empty_prompts, max_length=max_length, tokenizer=tokenizer, omit_global_caption=args.omit_global_caption))
@@ -584,7 +608,7 @@ def load_pretrained(path, device=torch.device("cuda"), return_pipe=True, load_sa
     with open(path / "args.json") as f:
         args = argparse.Namespace(**json.load(f))
         
-    if hasattr(args, "startfrom"):
+    if hasattr(args, "startfrom") and args.startfrom is not None:
         transformer, tokenizer, text_encoder, noise_scheduler, vae, weight_dtype = load_pretrained(args.startfrom, device=device, return_pipe=False, load_saved_state_dict=True)
     else:
         transformer, tokenizer, text_encoder, noise_scheduler, vae, weight_dtype = load_model(args, None, device)
@@ -606,6 +630,8 @@ def load_pretrained(path, device=torch.device("cuda"), return_pipe=True, load_sa
         pipeline.vae = vae
         pipeline.text_encoder = text_encoder
         pipeline.transformer = transformer
+        
+        pipeline.set_preprocess_example(partial(preprocess_example, proportion_empty_prompts=args.proportion_empty_prompts, max_length=args.max_token_length, omit_global_caption=args.omit_global_caption))
         
         return pipeline, tokenizer, noise_scheduler, args
     else:
@@ -688,7 +714,12 @@ def configure_optimizer(args, trainable_layers, transformer, accelerator):
 
 def adapt_transformer_controlnet(transformer, args=None, control_encoder=None, control_encoder2=None, num_layers=-1, _return_trainable=False, weight_dtype=torch.float32, use_attention_embeddings=False):
     # convert vanilla Transformer model to one that also takes the control signal and has a controlnet branch
-    transformer = PixArtTransformer2DModelWithLayoutControlNet.adapt(transformer, control_encoder=control_encoder, control_encoder2=control_encoder2, num_layers=num_layers, use_controlnet=args.use_controlnet, use_adapters=args.use_adapters, use_controllora=args.use_controllora, lora_rank=args.lora_rank, use_identlin=args.use_identlin, use_attention_embeddings=use_attention_embeddings)
+    transformer = PixArtTransformer2DModelWithLayoutControlNet.adapt(transformer, control_encoder=control_encoder, control_encoder2=control_encoder2, 
+                                                                     num_layers=num_layers, use_controlnet=args.use_controlnet, use_adapters=args.use_adapters, 
+                                                                     use_controllora=args.use_controllora, lora_rank=args.lora_rank, 
+                                                                     use_identlin=args.use_identlin, 
+                                                                     use_attention_embeddings=use_attention_embeddings,
+                                                                     use_masked_attention=default(lambda: not args.no_masked_attention, True))
     transformer.to(weight_dtype)
     
     if _return_trainable:
@@ -1308,6 +1339,62 @@ def mainfire_controlnet(
         main(args)
 
 
+  
+def mainfire_controlnet_bbox(
+        train_data_dir="/USERSPACE/lukovdg1/coco2017",
+        # use_identlin=True,
+        use_bbox=True,
+        no_masked_attention=True,
+        output_dir="/USERSPACE/lukovdg1/pixart-sigma/train_scripts/control_experiments_v2/pixart_coco_layoutcontrolnet2_bbox_notextcontrol",
+        # resume_from_checkpoint="latest",
+        pretrained_model_name_or_path="PixArt-alpha/PixArt-Sigma-XL-2-512-MS",
+        use_controlnet=True,
+        omit_global_caption=True,
+        control_encoder="/USERSPACE/lukovdg1/pixart-sigma/train_scripts/control_ae_output_v2_controlnet/encoder.pth",
+        num_control_layers=14,
+        # use_adapters=True,
+        # control_encoder2="/USERSPACE/lukovdg1/pixart-sigma/train_scripts/control_ae_output_v2_simpleadapter/encoder.pth",
+        validate_every=250,
+        learning_rate=1e-5,
+        max_grad_norm=1.,
+        num_train_steps=50000,
+        checkpointing_steps=250,
+        save_every=5000,
+        # mixed_precision="fp16",
+        train_batch_size=2,
+        gradient_accumulation_steps=4,
+        # gradient_checkpointing=True,
+        num_validation_images=6,
+        seed=42,
+        **kwargs,
+    ):
+        fargs = locals().copy()
+        
+        dels = ["kwargs", "ModuleType", "_python_view_image_mod"]
+        for d in dels:
+            if d in fargs:
+                del fargs[d]
+                
+        print("kw", kwargs)
+        
+        actualargs = []
+        for k, v in fargs.items():
+            if v is True:
+                actualargs.append(f"--{k}")
+            else:
+                actualargs.append(f"--{k}={v}")
+        
+        for k, v in kwargs.items():
+            if v is True:
+                actualargs.append(f"--{k}")
+            else:
+                actualargs.append(f"--{k}={v}")
+                
+        args = parse_args(actualargs)
+            
+        main(args)
+
+
 # DONE: Implement custom pipeline (PixArtSigmaControlNetPipeline)
 # DONE: Implement validator that uses this pipeline
 # DONE: Implement saving and loading of model and checkpoints
@@ -1338,13 +1425,26 @@ def mainfire_controlnet(
 #    [V]: train
 
 # DONE: properly train control-lora with batch size 32 and 50k steps
-# TODO: try simple adapters + lora
+# NOTYET: try simple adapters + lora
 
-# TODO: try layoutcontrolnet with single-prompt and object layer embeddings
 # TODO: try layoutcontrolnet with single-prompt and attention mask in the control layers in addition to object layer embeddings
-# TODO: train layoutcontrolnet with bounding boxes
+
+# DONE: trained layoutcontrolnet with single-prompt and attention mask only (no global, no obj layer embeds)  --> train_scripts/control_experiments_v2/pixart_coco_layoutcontrolnet2_attnctrl_noemb_noglobal
+# DONE: check if layoutcontrolnet learned to take into account prompts when shapes are ambiguous --> yes!
+
+# DONE: train layoutcontrolnet with bounding boxes --> works but image quality still bad
+
+# TODO: investigate why image quality is bad:
+#           MaskControlNet (without text control) produces better quality.
+#           
+
+# TODO: train controlnet for bboxes only (no text) to see if bbox conditioning is to blame for poor image quality
+# TODO: try layoutcontrolnet with single-prompt and object layer embeddings (? how to better inform model about which text corresponds to which regions?)  
+#    thought: if local specificity of CA is varied across heads and layer but is not content-dependent, then separating into two attention mechanisms with a learnable mixture should work
+
+# TODO: read MIGC++, DiffX, MS-Diffusion (citations of InstanceDiffusion)
 
 
 if __name__ == "__main__":
-    fire.Fire(mainfire_controlnet)
+    fire.Fire(mainfire_controlnet_bbox)
     # fire.Fire(mainfire_controllora)

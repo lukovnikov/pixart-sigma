@@ -1,4 +1,4 @@
-from copy import copy
+from copy import copy, deepcopy
 import math
 from PIL import Image, ImageDraw
 import json
@@ -664,7 +664,7 @@ class COCOInstancesDataset(Dataset):
     padlimit=1 #5
     min_region_area = 16*16 #-1 # 0.002
     
-    def __init__(self, maindir:str=None, split="valid", max_masks=20, min_masks=2, max_samples=None, min_size=350, upscale_to=None):
+    def __init__(self, maindir:str=None, split="valid", max_masks=20, min_masks=2, max_samples=None, min_size=350, upscale_to=None, use_bbox=False):
         super().__init__()
         self.maindir = maindir
         self.n = 0
@@ -673,6 +673,8 @@ class COCOInstancesDataset(Dataset):
         self.min_masks = min_masks
         self.min_size = min_size
         self.upscale_to = upscale_to
+        
+        self.use_bbox = use_bbox
             
         sizestats = {}
         examplespersize = {}
@@ -862,6 +864,12 @@ class COCOInstancesDataset(Dataset):
         
         for i, (mask) in enumerate(seg_imgtensor.unbind(0)):
             maskid = ids.pop(0)
+            mask = deepcopy(mask)
+            if self.use_bbox:   # convert mask to bbox
+                topleft = mask.nonzero().min(0)[0]
+                bottomright = mask.nonzero().max(0)[0]
+                mask.fill_(0)
+                mask[topleft[0]:bottomright[0], topleft[1]:bottomright[1]] = True
             cond_imgtensor[maskid] = mask
             segcaptions[maskid] = example.seg_info[i]["caption"]
             
