@@ -175,3 +175,5 @@ testimages2/
 *logs/
 *saved-*
 control_experiments_v2/
+train_scripts/experiments
+train_scripts/experiments_v2
