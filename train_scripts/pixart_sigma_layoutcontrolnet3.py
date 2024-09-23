@@ -228,6 +228,36 @@ class FeatureGate(torch.nn.Module):
         return gated_main + gated_branch
     
     
+class AttnMixer(torch.nn.Module):
+    def __init__(self, dim, numheads):
+        super().__init__()
+        self.dim, self.numheads = dim, numheads
+        self.model = torch.nn.Sequential(
+            torch.nn.Linear(self.dim, self.dim // 2),
+            torch.nn.SiLU(),
+            torch.nn.Linear(self.dim // 2, self.dim),
+            torch.nn.SiLU(),
+            torch.nn.Linear(self.dim, self.numheads),
+            torch.nn.Sigmoid(),
+        )
+        
+    def forward(self, x):
+        batsize, numheads, numpix, dim = x.shape
+        ret = x.transpose(1, 2).view(batsize, numpix, numheads * dim)
+        ret = self.model(ret)
+        return ret 
+    
+    
+class AttnMixerLight(torch.nn.Module):
+    def __init__(self, dim, numheads):
+        super().__init__()
+        self.dim, self.numheads = dim, numheads
+        self.headweights = torch.nn.Parameter(torch.zeros(self.numheads))
+        
+    def forward(self, x):
+        ret = torch.sigmoid(self.headweights[None, None])
+        return ret
+    
 
 class CustomAttnProcessor2_0:
     r"""
@@ -241,10 +271,16 @@ class CustomAttnProcessor2_0:
             raise ImportError("AttnProcessor2_0 requires PyTorch 2.0, to use it, please upgrade PyTorch to 2.0.")
         
     @classmethod
-    def adapt(cls, obj, attn, use_attention_embeddings=False):
+    def adapt(cls, obj, attn, use_attention_embeddings=False, mask_attention=True, attention_mix=False, attention_mix_light=False):
         obj.__class__ = cls
         NUM_OBJ_LAYERS = 25
         T5_DIM = 1152
+        if attention_mix:
+            attn.attnmix = AttnMixer(T5_DIM, attn.heads)
+        
+        obj.mask_attention = True if (mask_attention or attention_mix) else False
+        obj.attention_mix = attention_mix
+        
         if use_attention_embeddings:
             attn.obj_layer_embed = torch.nn.Embedding(NUM_OBJ_LAYERS, T5_DIM)
             torch.nn.init.zeros_(attn.obj_layer_embed.weight)
@@ -318,7 +354,13 @@ class CustomAttnProcessor2_0:
         # the output of sdp = (batch, num_heads, seq_len, head_dim)
         # TODO: add support for attn.scale when we move to Torch 2.1
         
+        # 1. compute attention without object masks
+        hidden_states = torch.nn.functional.scaled_dot_product_attention(
+            query, key, value, attn_mask=attention_mask, dropout_p=0.0, is_causal=False
+        )
+        
         if self.mask_attention:
+            # 2. compute attention with object masks
             object_masks = torch.nn.functional.avg_pool2d(object_masks, 16, 16) > 0
             # globalonly = torch.where(object_masks.sum(1) > 0, torch.zeros_like(object_masks[:, 0]), torch.ones_like(object_masks[:, 0]))
             globalonly = torch.ones_like(object_masks[:, 0])
@@ -330,9 +372,16 @@ class CustomAttnProcessor2_0:
             
             attention_mask = torch.min(attention_mask, object_attention_mask)
 
-        hidden_states = torch.nn.functional.scaled_dot_product_attention(
-            query, key, value, attn_mask=attention_mask, dropout_p=0.0, is_causal=False
-        )
+            masked_hidden_states = torch.nn.functional.scaled_dot_product_attention(
+                query, key, value, attn_mask=attention_mask, dropout_p=0.0, is_causal=False
+            )
+            
+            if self.attention_mix:
+                # 3. combine attentions with and without object masks
+                mixweights = attn.attnmix(query).transpose(1, 2)[:, :, :, None]
+                hidden_states = hidden_states * mixweights + masked_hidden_states * (1 - mixweights)
+            else:
+                hidden_states = masked_hidden_states
 
         hidden_states = hidden_states.transpose(1, 2).reshape(batch_size, -1, attn.heads * head_dim)
         hidden_states = hidden_states.to(query.dtype)
@@ -376,7 +425,9 @@ class PixArtTransformer2DModelWithLayoutControlNet(PixArtTransformer2DModel):
             ])
     
     @classmethod
-    def adapt(cls, main, control_encoder=None, control_encoder2=None, num_layers=-1, use_controlnet=False, use_adapters=False, use_controllora=False, lora_rank=64, use_identlin=False, use_attention_embeddings=False, use_masked_attention=False):
+    def adapt(cls, main, control_encoder=None, control_encoder2=None, num_layers=-1, use_controlnet=False, 
+              use_adapters=False, use_controllora=False, lora_rank=64, use_identlin=False, 
+              use_attention_embeddings=False, use_masked_attention=False, use_attention_mix=False, use_attention_mix_light=False):
         main.__class__ = cls
         main.control_blocks, main.zeroconvs, main.simple_connectors = None, None, None
         
@@ -393,9 +444,8 @@ class PixArtTransformer2DModelWithLayoutControlNet(PixArtTransformer2DModel):
                     
             for block in main.control_blocks:
                 if block is not None:
-                    CustomAttnProcessor2_0.adapt(block.attn2.processor, block.attn2, use_attention_embeddings=use_attention_embeddings)
-                    if not use_masked_attention:
-                        block.attn2.processor.mask_attention = False
+                    CustomAttnProcessor2_0.adapt(block.attn2.processor, block.attn2, use_attention_embeddings=use_attention_embeddings, 
+                                                 mask_attention=use_masked_attention, attention_mix=use_attention_mix, attention_mix_light=use_attention_mix_light)
                     
         
         if use_adapters:
@@ -993,6 +1043,3 @@ class PixArtSigmaLayoutControlNetPipeline(PixArtSigmaPipeline):
             return (image,)
 
         return ImagePipelineOutput(images=image)
-
-
-# DO NOT USE THIS!!!    --->  pixart_sigma_layoutcontrolnet2.py has the same functionality

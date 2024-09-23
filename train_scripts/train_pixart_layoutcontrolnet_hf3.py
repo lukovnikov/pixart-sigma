@@ -49,7 +49,7 @@ from diffusers import AutoencoderKL, DDPMScheduler, DiffusionPipeline, StableDif
     Transformer2DModel as Transformer2DModel
     # PixArtTransformer2DModel as Transformer2DModel
 
-from pixart_sigma_layoutcontrolnet2 import PixArtSigmaLayoutControlNetPipeline, PixArtTransformer2DModelWithLayoutControlNet, create_zeroconv2d, preprocess_example, collate_fn, encode_text
+from pixart_sigma_layoutcontrolnet3 import PixArtSigmaLayoutControlNetPipeline, PixArtTransformer2DModelWithLayoutControlNet, create_zeroconv2d, preprocess_example, collate_fn, encode_text
     
 from transformers import T5EncoderModel, T5Tokenizer
 from diffusers.optimization import get_scheduler
@@ -154,6 +154,25 @@ def parse_args(inpargs):
         action="store_true",
         help=(
             "Whether to use bbox masks instead of instance masks."
+        ),
+    )
+    
+    
+    parser.add_argument(
+        "--use_attention_mix",
+        default=False,
+        action="store_true",
+        help=(
+            "Whether to use attention mix instead of just masking attention."
+        ),
+    )
+    
+    parser.add_argument(
+        "--use_attention_mix_light",
+        default=False,
+        action="store_true",
+        help=(
+            "Whether to use attention mix light instead of full attention mix. Light mix only learns per-head per-layer, independently of input."
         ),
     )
     
@@ -719,7 +738,9 @@ def adapt_transformer_controlnet(transformer, args=None, control_encoder=None, c
                                                                      use_controllora=args.use_controllora, lora_rank=args.lora_rank, 
                                                                      use_identlin=args.use_identlin, 
                                                                      use_attention_embeddings=use_attention_embeddings,
-                                                                     use_masked_attention=default(lambda: not args.no_masked_attention, True))
+                                                                     use_masked_attention=default(lambda: not args.no_masked_attention, True),
+                                                                     use_attention_mix=default(lambda: args.use_attention_mix, False),
+                                                                     use_attention_mix_light=default(lambda: args.use_attention_mix_light, False))
     transformer.to(weight_dtype)
     
     if _return_trainable:
@@ -1344,14 +1365,14 @@ def mainfire_controlnet_bbox(
         train_data_dir="/USERSPACE/lukovdg1/coco2017",
         # use_identlin=True,
         use_bbox=True,
-        no_masked_attention=True,
-        output_dir="/USERSPACE/lukovdg1/pixart-sigma/train_scripts/control_experiments_v2/pixart_coco_layoutcontrolnet2_bbox_notextcontrol",
+        # no_masked_attention=True,
+        output_dir="/USERSPACE/lukovdg1/pixart-sigma/train_scripts/control_experiments_v2/pixart_coco_layoutcontrolnet3_l7_bbox_attnmask",
         # resume_from_checkpoint="latest",
         pretrained_model_name_or_path="PixArt-alpha/PixArt-Sigma-XL-2-512-MS",
         use_controlnet=True,
         omit_global_caption=True,
         control_encoder="/USERSPACE/lukovdg1/pixart-sigma/train_scripts/control_ae_output_v2_controlnet/encoder.pth",
-        num_control_layers=14,
+        num_control_layers=7,
         # use_adapters=True,
         # control_encoder2="/USERSPACE/lukovdg1/pixart-sigma/train_scripts/control_ae_output_v2_simpleadapter/encoder.pth",
         validate_every=250,
@@ -1438,9 +1459,22 @@ def mainfire_controlnet_bbox(
 #           MaskControlNet (without text control) produces better quality.
 #           
 
-# TODO: train controlnet for bboxes only (no text) to see if bbox conditioning is to blame for poor image quality
-# TODO: try layoutcontrolnet with single-prompt and object layer embeddings (? how to better inform model about which text corresponds to which regions?)  
+# DONE: train controlnet for bboxes only (no text) to see if bbox conditioning is to blame for poor image quality
+#  --> image quality doesn't look much better than when using text conditioning, but maybe it is slightly better
+# INFO: try layoutcontrolnet with single-prompt and object layer embeddings (? how to better inform model about which text corresponds to which regions?)  
 #    thought: if local specificity of CA is varied across heads and layer but is not content-dependent, then separating into two attention mechanisms with a learnable mixture should work
+
+# DONE: try layoutcontrolnet with attention mix --> TODO: maybe we also need attention mix in backbone?
+# TODO: finish training bbox layoutcontrolnet with attention mix
+# DONE: check bbox variants with three balls example: bbox + attention-mix gave worse image quality (boring) than bbox only
+
+# BBOX:
+# TODO: train bbox + attention-mask with 7 layers
+# TODO: try light attention-mix
+
+# BBOX/MASK
+# TODO: implement bbox/mask + attention-mask
+# TODO: train bbox/mask + attention-mask (with 7 layers?)
 
 # TODO: read MIGC++, DiffX, MS-Diffusion (citations of InstanceDiffusion)
 
@@ -1448,6 +1482,3 @@ def mainfire_controlnet_bbox(
 if __name__ == "__main__":
     fire.Fire(mainfire_controlnet_bbox)
     # fire.Fire(mainfire_controllora)
-    
-    
-# DO NOT USE THIS!!!    --->  pixart_sigma_layoutcontrolnet2.py has the same functionality
