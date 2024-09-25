@@ -1366,13 +1366,13 @@ def mainfire_controlnet_bbox(
         # use_identlin=True,
         use_bbox=True,
         # no_masked_attention=True,
-        output_dir="/USERSPACE/lukovdg1/pixart-sigma/train_scripts/control_experiments_v2/pixart_coco_layoutcontrolnet3_l7_bbox_attnmask",
+        output_dir="/USERSPACE/lukovdg1/pixart-sigma/train_scripts/control_experiments_v2/pixart_coco_layoutcontrolnet3_bbox_attnmask",
         # resume_from_checkpoint="latest",
         pretrained_model_name_or_path="PixArt-alpha/PixArt-Sigma-XL-2-512-MS",
         use_controlnet=True,
         omit_global_caption=True,
         control_encoder="/USERSPACE/lukovdg1/pixart-sigma/train_scripts/control_ae_output_v2_controlnet/encoder.pth",
-        num_control_layers=7,
+        num_control_layers=14,
         # use_adapters=True,
         # control_encoder2="/USERSPACE/lukovdg1/pixart-sigma/train_scripts/control_ae_output_v2_simpleadapter/encoder.pth",
         validate_every=250,
@@ -1469,8 +1469,9 @@ def mainfire_controlnet_bbox(
 # DONE: check bbox variants with three balls example: bbox + attention-mix gave worse image quality (boring) than bbox only
 
 # BBOX:
-# TODO: train bbox + attention-mask with 7 layers
+# DONE: train bbox + attention-mask with 7 layers --> kind of the same
 # TODO: try light attention-mix
+# TODO: continue training regular variant (14 layers, bbox + attn-mask)
 
 # BBOX/MASK
 # TODO: implement bbox/mask + attention-mask
