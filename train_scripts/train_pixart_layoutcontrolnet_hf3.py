@@ -543,13 +543,51 @@ def default(f, fallback):
         return fallback
     
 
+def mask_to_bbox(example, bbox_prob=1.00001, bbox_value=1.):
+    for i in range(len(example["seg_captions"])):
+        mask = example["cond_image"][i]
+        if mask.sum().item() > 0:
+            if random.random() < bbox_prob:
+                topleft = mask.nonzero().min(0)[0]
+                bottomright = mask.nonzero().max(0)[0]
+                mask = mask.float().fill_(0.)
+                mask[topleft[0]:bottomright[0], topleft[1]:bottomright[1]] = bbox_value
+                example["cond_image"][i] = mask
+    return example
+    
+    
+def crop_random(example):
+    # random square crop of size divisble by 64 and maximum size 512
+    imgtensor, cond_imgtensor, segcaptions = example["image"], example["cond_image"], example["seg_captions"]
+    
+    cropsize = min((min(imgtensor[0].shape) // 64) * 64, 512)
+    crop = (random.randint(0, imgtensor.shape[1] - cropsize), 
+            random.randint(0, imgtensor.shape[2] - cropsize))
+    # print(cropsize)
+    
+    imgtensor = imgtensor[:, crop[0]:crop[0]+cropsize, crop[1]:crop[1]+cropsize]
+    cond_imgtensor = cond_imgtensor[:, crop[0]:crop[0]+cropsize, crop[1]:crop[1]+cropsize]
+    
+    # if we cropped such that an object is no longer visible, remove caption
+    for i, croppedmask in enumerate(cond_imgtensor.unbind(0)):
+        if croppedmask.sum() == 0:
+            segcaptions[i] = None
+            
+    example["image"], example["cond_image"], example["seg_captions"] = imgtensor, cond_imgtensor, segcaptions
+    return example
+    
+    
+    
 NUMOBJ = 20
 def load_data(args, tokenizer, split="train"):
     # See Section 3.1. of the paper.
     max_length = args.max_token_length
     
     # if accelerator.is_main_process:
-    dataset = COCOInstancesDataset(maindir=args.train_data_dir, split=split, upscale_to=512, max_masks=NUMOBJ, use_bbox=default(lambda: args.use_bbox, None))
+    dataset = COCOInstancesDataset(maindir=args.train_data_dir, split=split, upscale_to=512, max_masks=NUMOBJ)
+    if args.use_bbox:
+        dataset.transforms.append(mask_to_bbox)
+    dataset.transforms.append(crop_random)
     
     # with accelerator.is_main_process:
     dataset.transforms.append(partial(preprocess_example, proportion_empty_prompts=args.proportion_empty_prompts, max_length=max_length, tokenizer=tokenizer, omit_global_caption=args.omit_global_caption))

@@ -664,7 +664,7 @@ class COCOInstancesDataset(Dataset):
     padlimit=1 #5
     min_region_area = 16*16 #-1 # 0.002
     
-    def __init__(self, maindir:str=None, split="valid", max_masks=20, min_masks=2, max_samples=None, min_size=350, upscale_to=None, use_bbox=False):
+    def __init__(self, maindir:str=None, split="valid", max_masks=20, min_masks=2, max_samples=None, min_size=350, upscale_to=None):
         super().__init__()
         self.maindir = maindir
         self.n = 0
@@ -673,8 +673,6 @@ class COCOInstancesDataset(Dataset):
         self.min_masks = min_masks
         self.min_size = min_size
         self.upscale_to = upscale_to
-        
-        self.use_bbox = use_bbox
             
         sizestats = {}
         examplespersize = {}
@@ -852,7 +850,7 @@ class COCOInstancesDataset(Dataset):
         
         # 3. create conditioning image by randomly swapping out colors
         # cond_imgtensor = torch.ones_like(imgtensor) * torch.tensor(randomcolor_hsv())[:, None, None]
-        cond_imgtensor = torch.zeros(self.max_masks + 1, imgtensor.size(1), imgtensor.size(2), dtype=torch.long, device=imgtensor.device)
+        cond_imgtensor = torch.zeros(self.max_masks + 1, imgtensor.size(1), imgtensor.size(2), device=imgtensor.device, dtype=torch.float)
         
         # 4. pick one caption at random (TODO: or generate one from regions)
         captions = [random.choice(example.captions)]
@@ -865,11 +863,6 @@ class COCOInstancesDataset(Dataset):
         for i, (mask) in enumerate(seg_imgtensor.unbind(0)):
             maskid = ids.pop(0)
             mask = deepcopy(mask)
-            if self.use_bbox:   # convert mask to bbox
-                topleft = mask.nonzero().min(0)[0]
-                bottomright = mask.nonzero().max(0)[0]
-                mask.fill_(0)
-                mask[topleft[0]:bottomright[0], topleft[1]:bottomright[1]] = True
             cond_imgtensor[maskid] = mask
             segcaptions[maskid] = example.seg_info[i]["caption"]
             
@@ -880,20 +873,6 @@ class COCOInstancesDataset(Dataset):
             bgrmask = cond_imgtensor.long().sum(0) == 0
             cond_imgtensor[maskid] = bgrmask
 
-        # random square crop of size divisble by 64 and maximum size 512
-        cropsize = min((min(imgtensor[0].shape) // 64) * 64, 512)
-        crop = (random.randint(0, imgtensor.shape[1] - cropsize), 
-                random.randint(0, imgtensor.shape[2] - cropsize))
-        # print(cropsize)
-        
-        imgtensor = imgtensor[:, crop[0]:crop[0]+cropsize, crop[1]:crop[1]+cropsize]
-        cond_imgtensor = cond_imgtensor[:, crop[0]:crop[0]+cropsize, crop[1]:crop[1]+cropsize]
-        
-        # if we cropped such that an object is no longer visible, remove caption
-        for i, croppedmask in enumerate(cond_imgtensor.unbind(0)):
-            if croppedmask.sum() == 0:
-                segcaptions[i] = None
-            
         imgtensor = imgtensor * 2 - 1.
         
         ret = { "image": imgtensor, 

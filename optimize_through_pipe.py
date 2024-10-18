@@ -325,9 +325,9 @@ def main_forward(lr=1e-3,
     
     diffpipe = DiffPipe(pipe, scheduler=forward_scheduler, device=pipe.device)
     
-    # with torch.no_grad():       # verify that with original noise, our adapted pipeline generates the same image
-    #     check_image = ztmodel(original_zT.to(pipe.vae.device), prompt)
-    #     check_image = latent_to_pil(check_image, pipe)[0]
+    with torch.no_grad():       # verify that with original noise, our adapted pipeline generates the same image
+        check_image = diffpipe(original_zT.to(pipe.vae.device), prompt)
+        check_image = latent_to_pil(check_image, pipe)[0]
     
     inverted = torch.nn.Parameter(_inverted.detach().clone())
     optim = torch.optim.Adam([inverted], lr=lr)
@@ -432,4 +432,5 @@ def main_inverse(lr=1e-3,
 
 
 if __name__ == "__main__":
-    fire.Fire(main_inverse)
+    # fire.Fire(main_inverse)
+    fire.Fire(main_forward)

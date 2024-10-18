@@ -1,0 +1,14 @@
+{
+	"folders": [
+		{
+			"path": "../sd3-diffusers"
+		},
+		{
+			"path": "."
+		},
+		{
+			"path": "../controlnet11"
+		}
+	],
+	"settings": {}
+}
