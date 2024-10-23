@@ -12,10 +12,12 @@ from diffusers.pipelines.stable_diffusion.pipeline_stable_diffusion import retri
 # from diffusers.pipelines.stable_diffusion.pipeline_flax_stable_diffusion_img2img import retrieve_latents
 from diffusers.utils import make_image_grid
 
-from torchvision.transforms.functional import to_pil_image, to_tensor
+from torchvision.transforms.functional import to_pil_image, to_tensor, gaussian_blur
 
 from torch.utils.checkpoint import checkpoint
 import tqdm
+
+import PIL
 
 
 def wiggle_latents(latents: torch.Tensor, l=1) -> torch.Tensor:
@@ -371,22 +373,56 @@ def main_forward(lr=1e-3,
     
     
 def main_inverse(lr=1e-3,
+         image="stalin0.jpg",
+         mask="stalin0.mask.jpg",
+         prompt="a photograph of stalin and his advisers taking a walk by the river",
          updates=100):
+    
+    if isinstance(image, str):      # probably a path
+        image = PIL.Image.open(image).convert("RGB")
+        
+        if mask is None:
+            mask = PIL.Image.new('L', image.size, 0)  # 'L' for grayscale, 0 for black (transparent)
+            # Create a drawing context for the mask
+            draw = PIL.ImageDraw.Draw(mask)
+
+            # STALIN MASKS
+            # Draw a shape on the mask (e.g., an ellipse)
+            # stalin's face
+            draw.ellipse((160, 131, 227, 192), fill=255)  # Fill the ellipse with white (opaque)
+            # removed face
+            draw.ellipse((350, 183, 401, 240), fill=255)  # Fill the ellipse with white (opaque)
+            # face on the left
+            draw.ellipse((10, 150, 77, 200), fill=255)  # Fill the ellipse with white (opaque)
+            
+        else:
+            mask = PIL.Image.open(mask).convert("L")
+        blurred_mask = mask.filter(PIL.ImageFilter.GaussianBlur(radius=5))  # Adjust the radius as needed
+        blurred_mask_pt = to_tensor(blurred_mask)
+        latent_blurred_mask = torch.nn.functional.interpolate(blurred_mask_pt[None], size=64, mode="bilinear")[0]
+
+        pixel_replace = deepcopy(image)
+        # Apply the mask to the image
+        pixel_replace.putalpha(blurred_mask)  # This adds the mask to the image's alpha channel
+        
     # inverse test: generate an image, invert it and optimize reconstruction to produce a latent closer to original latent
     pipe, forward_scheduler, inverse_scheduler = load_pipe()
     
+    if image is None:
     # ############ create example
-    # prompt = "a futuristic city skyline at sunset"
-    prompt = "a black and white photograph of a cow"
-    original_zT = torch.randn(1, 4, 64, 64)
-    image = generate_image(pipe, forward_scheduler, prompt=prompt, latents=original_zT)
+        # prompt = "a futuristic city skyline at sunset"
+        prompt = "a black and white photograph of a cow"
+        original_zT = torch.randn(1, 4, 64, 64)
+        image = generate_image(pipe, forward_scheduler, prompt=prompt, latents=original_zT)
+        
+        
     image_pt = to_tensor(image)
     _z0 = pixel_to_latent(image, pipe)
     
     inverted = invert_image(pipe=pipe, scheduler=inverse_scheduler, image=image)
     
     # check what reconstruction looks like, to later compare to what differentiable pipe produces
-    _recons = generate_image(pipe, forward_scheduler, prompt=prompt, latents=inverted)
+    # _recons = generate_image(pipe, forward_scheduler, prompt=prompt, latents=inverted)
     print(image_pt.shape, inverted.shape)
     # ############ end of create example
     
@@ -406,11 +442,21 @@ def main_inverse(lr=1e-3,
     inverted_history = []
     loss_history = []
     
-    recons_overview = None
+    
+    with torch.no_grad():
+        z0_init = pipe.vae.decode(z0 / pipe.vae.config.scaling_factor, return_dict=False)[0]
+        z0_init = to_pil_image(z0_init[0].clamp(-1, 1) * 0.5 + 0.5)
+        # compose faces into reconstruction
+        z0_init.paste(pixel_replace, (0, 0), pixel_replace)
     
     # training loop
     for update_number in tqdm.tqdm(range(updates)):
         optim.zero_grad()
+        
+        with torch.no_grad():
+            z0_image = pipe.vae.decode(z0 / pipe.vae.config.scaling_factor, return_dict=False)[0]
+            z0_image = to_pil_image(z0_image[0].clamp(-1, 1) * 0.5 + 0.5)
+            z0_image.paste(pixel_replace, (0, 0), pixel_replace)
         
         # recons = diffpipe(zT, prompt)
         inverted_latent = diffpipe(z0, "", guidance_scale=1.)
@@ -422,9 +468,12 @@ def main_inverse(lr=1e-3,
         loss_history.append(l.detach().item())
         l.backward()
         
+        optim.step()
+        
+        latent_blurred_mask = latent_blurred_mask.to(z0.device)
+        z0.data = latent_blurred_mask * _z0.data + (1 - latent_blurred_mask) * z0.data
         print(f"Step {update_number}: z_0 delta norm: {(z0 - _z0).norm().item():.5f}, z_0 grad norm: {z0.grad.norm().item():.5f}, loss: {l.item():.5f}")
         
-        optim.step()
         
     print("Done training")
     
@@ -432,5 +481,5 @@ def main_inverse(lr=1e-3,
 
 
 if __name__ == "__main__":
-    # fire.Fire(main_inverse)
-    fire.Fire(main_forward)
+    fire.Fire(main_inverse)
+    # fire.Fire(main_forward)
