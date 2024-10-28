@@ -1,6 +1,6 @@
 from typing import Any, Callable, Dict, List, Optional, Tuple, Union
 import torch
-from diffusers import FluxPipeline
+from diffusers import FluxPipeline, StableDiffusion3Pipeline
 from diffusers.schedulers.scheduling_ddim import DDIMScheduler
 from diffusers.schedulers.scheduling_flow_match_euler_discrete import FlowMatchEulerDiscreteScheduler, FlowMatchEulerDiscreteSchedulerOutput
 from diffusers.utils import make_image_grid
@@ -58,7 +58,9 @@ class FlowMatchEulerDiscreteSchedulerInverse(FlowMatchEulerDiscreteScheduler):
 
 
 def latent_to_pil(latents, height, width, pipe):
-    latents = pipe._unpack_latents(latents, height, width, pipe.vae_scale_factor)
+    if isinstance(pipe, FluxPipeline):
+        latents = pipe._unpack_latents(latents, height, width, pipe.vae_scale_factor)
+
     latents = (latents / pipe.vae.config.scaling_factor) + pipe.vae.config.shift_factor
     image = pipe.vae.decode(latents, return_dict=False)[0]
     image = pipe.image_processor.postprocess(image, output_type="pil")
@@ -66,12 +68,24 @@ def latent_to_pil(latents, height, width, pipe):
 
 
 def main(seed=42):
-    pipe = FluxPipeline.from_pretrained("black-forest-labs/FLUX.1-dev", torch_dtype=torch.bfloat16)
+    pipe = StableDiffusion3Pipeline.from_pretrained("stabilityai/stable-diffusion-3.5-large", torch_dtype=torch.bfloat16)
+    pipe = pipe.to(torch.device("cuda", 0))
+
+    # image = pipe(
+    #     "A capybara holding a sign that reads Hello World",
+    #     num_inference_steps=20,
+    #     guidance_scale=3.5,
+    # ).images[0]
+    
+    # pipe = FluxPipeline.from_pretrained("black-forest-labs/FLUX.1-dev", torch_dtype=torch.bfloat16)
+    # pipe = FluxPipeline.from_pretrained("black-forest-labs/FLUX.1-schnell", torch_dtype=torch.bfloat16)
+    # pipe = pipe.to("cuda", 1)
 
     pipe.enable_model_cpu_offload() #save some VRAM by offloading the model to CPU. Remove this if you have enough GPU power
     
     height, width = 512, 512
-    numsteps = 20
+    height, width = 1024, 1024
+    numsteps, numinvsteps = 20, 20
 
     prompt = "A cat holding a sign that says hello world"
     z0 = pipe(
@@ -81,7 +95,7 @@ def main(seed=42):
         guidance_scale=3.5,
         num_inference_steps=numsteps,
         max_sequence_length=512,
-        generator=torch.Generator("cpu").manual_seed(42),
+        generator=torch.Generator("cpu").manual_seed(41),
         output_type="latent",
     ).images[0]
     
@@ -98,23 +112,23 @@ def main(seed=42):
         latents=z0[None],
         height=height,
         width=width,
-        guidance_scale=1,
-        num_inference_steps=20,
+        guidance_scale=0,
+        num_inference_steps=numinvsteps,
         max_sequence_length=512,
-        generator=torch.Generator("cpu").manual_seed(0),
+        generator=torch.Generator("cpu").manual_seed(23),
         output_type="latent",
     ).images[0]
-    
     
     # reconstruct
     pipe.scheduler.__class__ = FlowMatchEulerDiscreteScheduler
     prompt = "A cat holding a sign that says hello world"
+    # prompt = "Animal"
     z0_rec = pipe(
         prompt,
         latents=zT_inv[None],
         height=height,
         width=width,
-        guidance_scale=3.5,
+        guidance_scale=1.,
         num_inference_steps=numsteps,
         max_sequence_length=512,
         generator=torch.Generator("cpu").manual_seed(69),
